@@ -436,7 +436,6 @@ async def show_location_button(message: types.Message) -> None:
         )
         await message.answer(
             "🏙 <b>Нажмите кнопку ниже, чтобы определить город.</b>\n\n"
-            "Приложение автоматически определит ваш IP. "
             "Это одноразовое действие. Город не будет виден никому.",
             parse_mode="HTML",
             reply_markup=keyboard,
