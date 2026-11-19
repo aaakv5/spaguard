@@ -30,7 +30,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
-# HTTPS-адрес вашего index.html на GitHub Pages / Vercel / Netlify
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
 if not WEB_APP_URL:
     raise RuntimeError(
@@ -48,7 +47,6 @@ DB_PATH       = os.getenv("DB_PATH", "spaguard.db")
 HINT_TTL      = int(os.getenv("HINT_TTL", "15"))
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-IP_GEO_API   = "https://api.2ip.me/geo.json"
 
 WMO_DESCRIPTIONS = {
     0: "☀️ Ясно", 1: "🌤 Преимущественно ясно", 2: "⛅ Переменная облачность",
@@ -343,7 +341,7 @@ def get_list(table: str, chat_id: int) -> list[tuple]:
         ).fetchall()
 
 
-# ─── ПОГОДА ────────────────────────────────────────────────────
+# ─── ПОГОДА: ГЕОЛОКАЦИЯ ПО IP (ipwho.is + ipapi.co) ──────────
 
 def get_user_location(user_id: int) -> Optional[tuple[float, float, str]]:
     with _conn() as c:
@@ -363,41 +361,105 @@ def set_user_location(user_id: int, lat: float, lon: float, city_label: str) -> 
 
 
 async def get_coords_by_ip(ip: str) -> Optional[tuple[float, float, str]]:
-    params = {"ip": ip}
+    """
+    Пытается получить координаты по IP через несколько бесплатных сервисов.
+    Порядок: ipwho.is → ipapi.co.
+    """
+    # ── 1) ipwho.is ─────────────────────────────────────────────
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(IP_GEO_API, params=params, timeout=10) as resp:
-                if resp.status != 200:
-                    logger.warning("2ip API вернул %s для IP %s", resp.status, ip)
-                    return None
-                data = await resp.json()
-                lat = data.get("latitude")
-                lon = data.get("longitude")
-                city = data.get("city_rus") or data.get("city") or ""
-                if lat is None or lon is None:
-                    logger.warning("В ответе 2ip нет координат: %s", data)
-                    return None
-                return float(lat), float(lon), city
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-        logger.warning("Ошибка запроса к 2ip для IP %s: %s", ip, e)
-        return None
+        timeout = aiohttp.ClientTimeout(total=10, connect=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            url = f"https://ipwho.is/{ip}"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("success") is False:
+                        logger.warning("ipwho.is: success=false для IP %s: %s", ip, data.get("message"))
+                    else:
+                        lat = data.get("latitude")
+                        lon = data.get("longitude")
+                        city = data.get("city") or ""
+                        if lat is not None and lon is not None:
+                            logger.info("ipwho.is дал координаты для %s: %s (%s, %s)", ip, city, lat, lon)
+                            return float(lat), float(lon), city
+                        else:
+                            logger.warning("ipwho.is: нет координат для IP %s: %s", ip, data)
+                else:
+                    logger.warning("ipwho.is вернул %s для IP %s", resp.status, ip)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning("ipwho.is недоступен: %s: %s", type(e).__name__, e)
+
+    # ── 2) ipapi.co (резерв) ────────────────────────────────────
+    try:
+        timeout = aiohttp.ClientTimeout(total=10, connect=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            url = f"https://ipapi.co/{ip}/json/"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("error"):
+                        logger.warning("ipapi.co: error для IP %s: %s", ip, data.get("reason"))
+                    else:
+                        lat = data.get("latitude")
+                        lon = data.get("longitude")
+                        city = data.get("city") or ""
+                        if lat is not None and lon is not None:
+                            logger.info("ipapi.co дал координаты для %s: %s (%s, %s)", ip, city, lat, lon)
+                            return float(lat), float(lon), city
+                        else:
+                            logger.warning("ipapi.co: нет координат для IP %s: %s", ip, data)
+                else:
+                    logger.warning("ipapi.co вернул %s для IP %s", resp.status, ip)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning("ipapi.co недоступен: %s: %s", type(e).__name__, e)
+
+    logger.error("Не удалось получить координаты ни через ipwho.is, ни через ipapi.co для IP %s", ip)
+    return None
 
 
 async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
+    """Запрос к Open-Meteo с fallback и подробным логированием."""
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        logger.error("Некорректные координаты: lat=%r, lon=%r", lat, lon)
+        return None
+
     params = {
         "latitude": lat,
         "longitude": lon,
         "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
         "timezone": "auto",
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(FORECAST_URL, params=params, timeout=10) as resp:
-                data = await resp.json()
-                return data.get("current")
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.warning("Запрос погоды не удался: %s", e)
-        return None
+
+    for attempt, use_ssl in enumerate((True, False), 1):
+        try:
+            connector = None if use_ssl else aiohttp.TCPConnector(ssl=False)
+            timeout = aiohttp.ClientTimeout(total=15, connect=5)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                async with session.get(FORECAST_URL, params=params) as resp:
+                    body = await resp.text()
+                    logger.info(
+                        "Open-Meteo (attempt %d, ssl=%s): status=%s, body[:150]=%r",
+                        attempt, use_ssl, resp.status, body[:150],
+                    )
+                    if resp.status != 200:
+                        logger.warning("Open-Meteo вернул %s: %s", resp.status, body[:500])
+                        continue
+                    try:
+                        data = json.loads(body)
+                    except json.JSONDecodeError as e:
+                        logger.error("Open-Meteo вернул невалидный JSON: %s", e)
+                        continue
+                    return data.get("current")
+        except aiohttp.ClientConnectorCertificateError as e:
+            logger.warning("SSL-ошибка (нет ca-certificates?): %s", e)
+            continue
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning("Запрос погоды (attempt %d) не удался: %s: %s",
+                           attempt, type(e).__name__, e)
+            continue
+
+    logger.error("Open-Meteo недоступен после 2 попыток")
+    return None
 
 
 def format_weather(current: dict) -> str:
@@ -741,7 +803,6 @@ async def handle_web_app_data(message: types.Message):
     logger.info("Сохранена локация для %s: %s (%s, %s)",
                 message.from_user.id, city, lat, lon)
 
-    # Просто подтверждение, без показа погоды
     await message.reply(
         "✅ <b>Местоположение сохранено.</b>\n\n"
         "Теперь напишите в чат слово <b>погода</b> — бот покажет данные.",
@@ -786,9 +847,9 @@ async def handle_weather_word(message: types.Message):
     )
 
 
-# ─── СТАРТ (ГЛАВНЫЙ ФИКС) ─────────────────────────────────────
+# ─── СТАРТ ────────────────────────────────────────────────────
 
-@dp.message(Command("start"))  # ← ловит и /start, и /start payload
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message, command: CommandObject):
     logger.info(
         "📥 /start от user=%s chat=%s type=%s payload=%r",
@@ -806,7 +867,6 @@ async def cmd_start(message: types.Message, command: CommandObject):
             )
         return
 
-    # В ЛС — всегда показываем кнопку web_app
     await show_location_button(message)
 
 
