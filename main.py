@@ -721,13 +721,16 @@ async def handle_web_app_data(message: types.Message):
             raise ValueError("IP отсутствует")
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("Некорректные данные от Mini App: %s", e)
-        await message.reply("❌ <b>Не удалось получить данные из приложения.</b>", parse_mode="HTML")
+        await message.reply(
+            "❌ <b>Не удалось получить данные из приложения.</b>\nПопробуйте ещё раз.",
+            parse_mode="HTML",
+        )
         return
 
     coords = await get_coords_by_ip(ip)
     if not coords:
         await message.reply(
-            "❌ <b>Не удалось определить местоположение по IP.</b>\n\n"
+            "❌ <b>Не удалось определить местоположение.</b>\n\n"
             "Возможно, вы используете VPN или прокси. Отключите VPN и попробуйте снова.",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove(),
@@ -736,14 +739,16 @@ async def handle_web_app_data(message: types.Message):
 
     lat, lon, city = coords
     set_user_location(message.from_user.id, lat, lon, city)
-    logger.info("Сохранена локация для %s: %s (%s, %s)", message.from_user.id, city, lat, lon)
+    logger.info("Сохранена локация для %s: %s (%s, %s)",
+                message.from_user.id, city, lat, lon)
 
-    text = "✅ <b>Местоположение сохранено.</b>\n\n"
-    current = await fetch_weather(lat, lon)
-    if current:
-        text += format_weather(current) + "\n\n"
-    text += "Теперь пишите <b>погода</b> в любом чате — бот покажет данные."
-    await message.reply(text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    # Просто подтверждение, без показа погоды
+    await message.reply(
+        "✅ <b>Местоположение сохранено.</b>\n\n"
+        "Теперь напишите в чат слово <b>погода</b> — бот покажет данные.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 # ─── ПОГОДА ПО СЛОВУ ──────────────────────────────────────────
