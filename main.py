@@ -15,10 +15,10 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     ChatPermissions,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    WebAppInfo,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
     ReplyKeyboardRemove,
+    EphemeralMessageParameters,
 )
 from aiogram.exceptions import TelegramBadRequest
 
@@ -29,7 +29,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
-WEB_APP_URL   = os.getenv("WEB_APP_URL", "")
+# Direct link на Mini App (настраивается в @BotFather → /newapp)
+MINI_APP_LINK = os.getenv("MINI_APP_LINK", "")
+
 WARN_LIMIT    = int(os.getenv("WARN_LIMIT", "3"))
 AUTO_BAN_DAYS = int(os.getenv("AUTO_BAN_DAYS", "7"))
 DB_PATH       = os.getenv("DB_PATH", "spaguard.db")
@@ -166,7 +168,7 @@ async def resolve_target(message: types.Message, target: Optional[str]) -> tuple
         return None, None
 
 
-# ─── УПРАВЛЕНИЕ ВИДИМОСТЬЮ ОТВЕТОВ ─────────────────────────────
+# ─── ОТПРАВКА СООБЩЕНИЙ ────────────────────────────────────────
 
 async def _auto_delete(msg: types.Message, delay: int) -> None:
     await asyncio.sleep(delay)
@@ -177,6 +179,23 @@ async def _auto_delete(msg: types.Message, delay: int) -> None:
 
 
 async def reply_private(message: types.Message, text: str, ttl: int = HINT_TTL) -> None:
+    """
+    Приватный ответ тому, кто вызвал команду.
+    В группе — ephemeral-сообщение (видно только автору).
+    В ЛС — обычное сообщение.
+    """
+    if message.chat.type in ("group", "supergroup"):
+        try:
+            await message.answer(
+                text,
+                parse_mode="HTML",
+                ephemeral_message_parameters=EphemeralMessageParameters(
+                    receiver_user_id=message.from_user.id
+                ),
+            )
+            return
+        except TelegramBadRequest:
+            pass
     try:
         await bot.send_message(message.from_user.id, text, parse_mode="HTML")
         return
@@ -825,56 +844,49 @@ async def handle_weather_word(message: types.Message):
     loc = get_user_location(user_id)
 
     if not loc:
-        if WEB_APP_URL:
-            keyboard = ReplyKeyboardMarkup(
-                keyboard=[[
-                    KeyboardButton(
+        # Погода: inline-кнопка с direct link на Mini App (работает в группах)
+        if MINI_APP_LINK:
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(
                         text="📍 Определить местоположение",
-                        web_app=WebAppInfo(url=WEB_APP_URL),
+                        url=MINI_APP_LINK,
                     )
-                ]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
+                ]]
             )
-            await reply_private(
-                message,
+            await message.answer(
                 "🏙 <b>Чтобы узнать погоду, нужно определить ваш город.</b>\n\n"
                 "Нажмите кнопку ниже — откроется мини-приложение, "
                 "которое автоматически определит ваш IP и покажет погоду. "
                 "Город не будет виден в чате.",
-                ttl=30,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                ephemeral_message_parameters=EphemeralMessageParameters(
+                    receiver_user_id=user_id
+                ),
             )
-            try:
-                await message.answer("Выберите действие:", reply_markup=keyboard)
-            except TelegramBadRequest:
-                pass
         else:
-            keyboard = ReplyKeyboardMarkup(
-                keyboard=[[
-                    KeyboardButton(
-                        text="📍 Отправить геолокацию",
-                        request_location=True,
-                    )
-                ]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
+            await message.answer(
+                "🏙 <b>Чтобы узнать погоду, напишите боту в личные сообщения</b>\n"
+                "и нажмите кнопку «Отправить геолокацию».\n\n"
+                "Это одноразовое действие. Город не будет виден в чате.",
+                parse_mode="HTML",
+                ephemeral_message_parameters=EphemeralMessageParameters(
+                    receiver_user_id=user_id
+                ),
             )
-            await reply_private(
-                message,
-                "🏙 <b>Чтобы узнать погоду, разрешите доступ к геолокации.</b>\n"
-                "Нажмите кнопку ниже.",
-                ttl=30,
-            )
-            try:
-                await message.answer("Выберите действие:", reply_markup=keyboard)
-            except TelegramBadRequest:
-                pass
         return
 
     lat, lon, _ = loc
     current = await fetch_weather(lat, lon)
     if not current:
-        await reply_private(message, "❌ <b>Сервис погоды временно недоступен.</b>")
+        await message.answer(
+            "❌ <b>Сервис погоды временно недоступен.</b>",
+            parse_mode="HTML",
+            ephemeral_message_parameters=EphemeralMessageParameters(
+                receiver_user_id=user_id
+            ),
+        )
         return
 
     text = format_weather(current)
@@ -921,8 +933,8 @@ async def cmd_help(message: types.Message):
 async def main():
     logger.info("SpaGuard запускается…")
     logger.info(
-        "WARN_LIMIT=%s, AUTO_BAN_DAYS=%s, HINT_TTL=%s, WEB_APP_URL=%s",
-        WARN_LIMIT, AUTO_BAN_DAYS, HINT_TTL, WEB_APP_URL or "(не задан)",
+        "WARN_LIMIT=%s, AUTO_BAN_DAYS=%s, HINT_TTL=%s, MINI_APP_LINK=%s",
+        WARN_LIMIT, AUTO_BAN_DAYS, HINT_TTL, MINI_APP_LINK or "(не задан)",
     )
     await restore_schedules()
     await dp.start_polling(bot)
