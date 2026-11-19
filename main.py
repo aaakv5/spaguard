@@ -12,7 +12,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     ChatPermissions,
     ReplyKeyboardMarkup,
@@ -30,10 +30,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
-# WEB_APP_URL — настоящий HTTPS-адрес вашего index.html (для web_app-кнопки)
+# HTTPS-адрес вашего index.html на GitHub Pages / Vercel / Netlify
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
-# MINI_APP_LINK — direct link t.me/bot/app (для inline-кнопок в группе)
-MINI_APP_LINK = os.getenv("MINI_APP_LINK", "").strip()
+if not WEB_APP_URL:
+    raise RuntimeError(
+        "WEB_APP_URL не задан.\n"
+        "Укажите в .env: WEB_APP_URL=https://ваш-username.github.io/spaguard/"
+    )
+if not WEB_APP_URL.startswith("https://"):
+    raise RuntimeError(
+        f"WEB_APP_URL должен начинаться с https://, сейчас: {WEB_APP_URL!r}"
+    )
 
 WARN_LIMIT    = int(os.getenv("WARN_LIMIT", "3"))
 AUTO_BAN_DAYS = int(os.getenv("AUTO_BAN_DAYS", "7"))
@@ -415,33 +422,7 @@ def format_weather(current: dict) -> str:
 
 
 async def show_location_button(message: types.Message) -> None:
-    logger.info("show_location_button: user=%s WEB_APP_URL=%r",
-                message.from_user.id, WEB_APP_URL)
-
-    if not WEB_APP_URL:
-        logger.error("WEB_APP_URL не задан в .env")
-        try:
-            await message.reply(
-                "❌ <b>Mini App не настроен.</b>\n"
-                "Администратор должен указать <code>WEB_APP_URL</code> в конфиге.",
-                parse_mode="HTML",
-            )
-        except TelegramBadRequest:
-            pass
-        return
-
-    if not WEB_APP_URL.startswith("https://"):
-        logger.error("WEB_APP_URL должен начинаться с https://, сейчас: %r", WEB_APP_URL)
-        try:
-            await message.reply(
-                "❌ <b>Ошибка конфигурации.</b>\n"
-                "<code>WEB_APP_URL</code> должен начинаться с <code>https://</code>.",
-                parse_mode="HTML",
-            )
-        except TelegramBadRequest:
-            pass
-        return
-
+    logger.info("show_location_button → user=%s", message.from_user.id)
     try:
         keyboard = ReplyKeyboardMarkup(
             keyboard=[[
@@ -453,7 +434,7 @@ async def show_location_button(message: types.Message) -> None:
             resize_keyboard=True,
             one_time_keyboard=True,
         )
-        await message.reply(
+        await message.answer(
             "🏙 <b>Нажмите кнопку ниже, чтобы определить город.</b>\n\n"
             "Приложение автоматически определит ваш IP. "
             "Это одноразовое действие. Город не будет виден никому.",
@@ -464,10 +445,9 @@ async def show_location_button(message: types.Message) -> None:
     except TelegramBadRequest as e:
         logger.error("Не удалось отправить кнопку: %s", e)
         try:
-            await message.reply(
+            await message.answer(
                 f"❌ <b>Ошибка при создании кнопки:</b>\n"
-                f"<code>{escape(str(e))}</code>\n\n"
-                f"Проверьте, что <code>WEB_APP_URL</code> — это HTTPS-ссылка на index.html.",
+                f"<code>{escape(str(e))}</code>",
                 parse_mode="HTML",
             )
         except TelegramBadRequest:
@@ -741,7 +721,7 @@ async def handle_web_app_data(message: types.Message):
             raise ValueError("IP отсутствует")
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("Некорректные данные от Mini App: %s", e)
-        await message.reply("❌ <b>Не удалось получить данные из приложения.</b>\nПопробуйте ещё раз.", parse_mode="HTML")
+        await message.reply("❌ <b>Не удалось получить данные из приложения.</b>", parse_mode="HTML")
         return
 
     coords = await get_coords_by_ip(ip)
@@ -792,20 +772,19 @@ async def handle_weather_word(message: types.Message):
         await show_location_button(message)
         return
 
-    # В группе — эфемерная подсказка со ссылкой на бота
     deep_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "https://t.me/"
     await reply_hint(
         message,
         "🏙 <b>Чтобы узнать погоду, определите город.</b>\n\n"
         f"Откройте <a href=\"{deep_link}\">личный чат с ботом</a> — "
-        "там сразу появится кнопка для определения местоположения.\n\n"
+        "там появится кнопка для определения местоположения.\n\n"
         "Это одноразовое действие. Город не будет виден в чате.",
     )
 
 
-# ─── СТАРТ / ХЭЛП ──────────────────────────────────────────────
+# ─── СТАРТ (ГЛАВНЫЙ ФИКС) ─────────────────────────────────────
 
-@dp.message(CommandStart(deep_link=True))  # ← ГЛАВНЫЙ ФИКС
+@dp.message(Command("start"))  # ← ловит и /start, и /start payload
 async def cmd_start(message: types.Message, command: CommandObject):
     logger.info(
         "📥 /start от user=%s chat=%s type=%s payload=%r",
@@ -823,7 +802,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
             )
         return
 
-    # В ЛС — всегда показываем кнопку
+    # В ЛС — всегда показываем кнопку web_app
     await show_location_button(message)
 
 
@@ -861,15 +840,9 @@ async def main():
     me = await bot.get_me()
     BOT_USERNAME = me.username
     logger.info("Бот: @%s", BOT_USERNAME)
-    logger.info("WEB_APP_URL=%r", WEB_APP_URL or "(не задан)")
-    logger.info("MINI_APP_LINK=%r", MINI_APP_LINK or "(не задан)")
+    logger.info("WEB_APP_URL=%s", WEB_APP_URL)
     logger.info("WARN_LIMIT=%s, AUTO_BAN_DAYS=%s, HINT_TTL=%s",
                 WARN_LIMIT, AUTO_BAN_DAYS, HINT_TTL)
-
-    if not WEB_APP_URL:
-        logger.warning("⚠ WEB_APP_URL пуст — кнопка определения геолокации не будет работать")
-    elif not WEB_APP_URL.startswith("https://"):
-        logger.warning("⚠ WEB_APP_URL должен начинаться с https://")
 
     await restore_schedules()
     await dp.start_polling(bot)
