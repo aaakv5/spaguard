@@ -12,7 +12,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     ChatPermissions,
     ReplyKeyboardMarkup,
@@ -59,7 +59,7 @@ logger = logging.getLogger("SpaGuard")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-BOT_USERNAME: Optional[str] = None  # заполним при старте
+BOT_USERNAME: Optional[str] = None
 
 # ─── БАЗА ДАННЫХ ───────────────────────────────────────────────
 
@@ -181,7 +181,6 @@ async def _auto_delete(msg: types.Message, delay: int) -> None:
 
 
 async def reply_hint(message: types.Message, text: str, ttl: int = HINT_TTL) -> None:
-    """Подсказка/ошибка только автору команды."""
     if message.chat.type in ("group", "supergroup"):
         try:
             await message.answer(
@@ -413,11 +412,9 @@ def format_weather(current: dict) -> str:
 
 
 async def show_location_button(message: types.Message) -> None:
-    """Показывает кнопку web_app (только в ЛС)."""
     if not MINI_APP_LINK:
         await message.reply(
-            "❌ <b>Mini App не настроен.</b>\n"
-            "Обратитесь к администратору бота.",
+            "❌ <b>Mini App не настроен.</b>\nОбратитесь к администратору.",
             parse_mode="HTML",
         )
         return
@@ -809,7 +806,7 @@ async def cmd_warnlist(message: types.Message):
     await reply_hint(message, "\n".join(lines))
 
 
-# ─── ГЕОЛОКАЦИЯ (GPS — резервный вариант) ─────────────────────
+# ─── ГЕОЛОКАЦИЯ (GPS) ─────────────────────────────────────────
 
 @dp.message(F.location)
 async def handle_location(message: types.Message):
@@ -837,8 +834,7 @@ async def handle_web_app_data(message: types.Message):
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("Некорректные данные от Mini App: %s", e)
         await message.reply(
-            "❌ <b>Не удалось получить данные из приложения.</b>\n"
-            "Попробуйте ещё раз.",
+            "❌ <b>Не удалось получить данные из приложения.</b>\nПопробуйте ещё раз.",
             parse_mode="HTML",
         )
         return
@@ -863,11 +859,7 @@ async def handle_web_app_data(message: types.Message):
         text += format_weather(current) + "\n\n"
     text += "Теперь пишите <b>погода</b> в любом чате — бот покажет данные."
 
-    await message.reply(
-        text,
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await message.reply(text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
 
 
 # ─── ПОГОДА ПО СЛОВУ «ПОГОДА» ─────────────────────────────────
@@ -880,7 +872,6 @@ async def handle_weather_word(message: types.Message):
     user_id = message.from_user.id
     loc = get_user_location(user_id)
 
-    # Местоположение уже известно — показываем погоду
     if loc:
         lat, lon, _ = loc
         current = await fetch_weather(lat, lon)
@@ -894,44 +885,50 @@ async def handle_weather_word(message: types.Message):
             await reply_public(message, text)
         return
 
-    # Местоположение неизвестно
     if message.chat.type == "private":
-        # В ЛС показываем web_app-кнопку — sendData() здесь работает
         await show_location_button(message)
         return
 
-    # В группе — эфемерная подсказка перейти в ЛС
-    bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "бота"
+    # В группе — эфемерная подсказка со ссылкой сразу на /start
+    deep_link = f"https://t.me/{BOT_USERNAME}?start=weather" if BOT_USERNAME else "https://t.me/"
     await reply_hint(
         message,
         "🏙 <b>Чтобы узнать погоду, определите город.</b>\n\n"
-        f"Откройте <a href=\"{bot_link}\">@{escape(BOT_USERNAME or 'бота')}</a> "
-        "в личных сообщениях и отправьте /start — там будет кнопка "
-        "для определения местоположения.\n\n"
+        f"Откройте <a href=\"{deep_link}\">личный чат с ботом</a> — "
+        "там сразу появится кнопка для определения местоположения.\n\n"
         "Это одноразовое действие. Город не будет виден в чате.",
     )
 
 
 # ─── СТАРТ / ХЭЛП ──────────────────────────────────────────────
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    # В группе /start показываем краткий хэлп только админам
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, command: CommandObject):
+    # Deep-link параметр (например, ?start=weather)
+    payload = command.args
+
     if message.chat.type in ("group", "supergroup"):
+        # В группе /start доступен всем — показываем ссылку на ЛС
+        deep_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "https://t.me/"
         if await is_admin(message.chat.id, message.from_user.id):
             await reply_hint(message, HELP_TEXT, ttl=60)
+        else:
+            await reply_hint(
+                message,
+                "👋 <b>Привет!</b> Я SpaGuard — бот для модерации и погоды.\n\n"
+                f"Чтобы узнать погоду, откройте <a href=\"{deep_link}\">личный чат со мной</a>.",
+            )
         return
 
     # В ЛС
-    loc = get_user_location(message.from_user.id)
-    if not loc:
+    if payload == "weather" or not get_user_location(message.from_user.id):
         await show_location_button(message)
         return
 
     await message.reply(
         "✅ <b>Местоположение уже определено.</b>\n\n"
         "Напишите <b>погода</b> — бот покажет данные.\n\n"
-        "Также доступны команды модерации в группах (см. /help).",
+        "Команды модерации доступны в группах (см. /help).",
         parse_mode="HTML",
     )
 
