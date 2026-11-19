@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -16,6 +17,7 @@ from aiogram.types import (
     ChatPermissions,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    WebAppInfo,
     ReplyKeyboardRemove,
 )
 from aiogram.exceptions import TelegramBadRequest
@@ -27,12 +29,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
+WEB_APP_URL   = os.getenv("WEB_APP_URL", "")
 WARN_LIMIT    = int(os.getenv("WARN_LIMIT", "3"))
 AUTO_BAN_DAYS = int(os.getenv("AUTO_BAN_DAYS", "7"))
 DB_PATH       = os.getenv("DB_PATH", "spaguard.db")
 HINT_TTL      = int(os.getenv("HINT_TTL", "15"))
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+IP_GEO_API   = "https://api.2ip.me/geo.json"
 
 WMO_DESCRIPTIONS = {
     0: "☀️ Ясно", 1: "🌤 Преимущественно ясно", 2: "⛅ Переменная облачность",
@@ -83,7 +87,6 @@ init_db()
 # ─── УТИЛИТЫ ───────────────────────────────────────────────────
 
 def parse_duration(s: Optional[str]) -> Optional[int]:
-    """'10s' / '30m' / '2h' / '7d' → Unix-timestamp окончания."""
     if not s:
         return None
     unit = s[-1].lower()
@@ -139,7 +142,6 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
 
 
 async def resolve_target(message: types.Message, target: Optional[str]) -> tuple[Optional[int], Optional[str]]:
-    """reply (не бот) → числовой ID → @username (последнее редко работает)."""
     if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
         if not u.is_bot:
@@ -175,7 +177,6 @@ async def _auto_delete(msg: types.Message, delay: int) -> None:
 
 
 async def reply_private(message: types.Message, text: str, ttl: int = HINT_TTL) -> None:
-    """Подсказка/ошибка — только тому, кто вызвал команду."""
     try:
         await bot.send_message(message.from_user.id, text, parse_mode="HTML")
         return
@@ -189,14 +190,13 @@ async def reply_private(message: types.Message, text: str, ttl: int = HINT_TTL) 
 
 
 async def reply_public(message: types.Message, text: str) -> None:
-    """Публичный ответ — видят все."""
     try:
         await message.reply(text, parse_mode="HTML")
     except TelegramBadRequest:
         pass
 
 
-# ─── ФОНОВЫЕ ЗАДАЧИ ДЛЯ АВТО-СНЯТИЯ ───────────────────────────
+# ─── ФОНОВЫЕ ЗАДАЧИ ────────────────────────────────────────────
 
 scheduled_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
 
@@ -256,7 +256,7 @@ async def restore_schedules() -> None:
         logger.info("Восстановлено задач: mutes=%s, bans=%s", len(mutes), len(bans))
 
 
-# ─── РАБОТА С БД ───────────────────────────────────────────────
+# ─── БД ────────────────────────────────────────────────────────
 
 def _conn():
     return sqlite3.connect(DB_PATH)
@@ -315,15 +315,14 @@ def get_list(table: str, chat_id: int) -> list[tuple]:
         ).fetchall()
 
 
-# ─── ПОГОДА: ЛОКАЦИЯ ──────────────────────────────────────────
+# ─── ПОГОДА ────────────────────────────────────────────────────
 
 def get_user_location(user_id: int) -> Optional[tuple[float, float, str]]:
     with _conn() as c:
-        row = c.execute(
+        return c.execute(
             "SELECT lat, lon, city_label FROM user_locations WHERE user_id=?",
             (user_id,),
         ).fetchone()
-        return row
 
 
 def set_user_location(user_id: int, lat: float, lon: float, city_label: str) -> None:
@@ -333,6 +332,27 @@ def set_user_location(user_id: int, lat: float, lon: float, city_label: str) -> 
             (user_id, lat, lon, city_label),
         )
         c.commit()
+
+
+async def get_coords_by_ip(ip: str) -> Optional[tuple[float, float, str]]:
+    params = {"ip": ip}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(IP_GEO_API, params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    logger.warning("2ip API вернул %s для IP %s", resp.status, ip)
+                    return None
+                data = await resp.json()
+                lat = data.get("latitude")
+                lon = data.get("longitude")
+                city = data.get("city_rus") or data.get("city") or ""
+                if lat is None or lon is None:
+                    logger.warning("В ответе 2ip нет координат: %s", data)
+                    return None
+                return float(lat), float(lon), city
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        logger.warning("Ошибка запроса к 2ip для IP %s: %s", ip, e)
+        return None
 
 
 async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
@@ -373,7 +393,7 @@ def format_weather(current: dict) -> str:
     return "\n".join(lines)
 
 
-# ─── ПАРСИНГ АРГУМЕНТОВ ────────────────────────────────────────
+# ─── ПАРСИНГ И ГЕЙТ ────────────────────────────────────────────
 
 def parse_args(command_args: Optional[str], has_reply: bool, with_duration: bool):
     parts = (command_args or "").split()
@@ -393,8 +413,6 @@ def parse_args(command_args: Optional[str], has_reply: bool, with_duration: bool
     reason = " ".join(parts) if parts else "не указана"
     return target, duration, reason
 
-
-# ─── ГЕЙТ: только группа + только админ ───────────────────────
 
 async def gate(message: types.Message) -> bool:
     if message.chat.type not in ("group", "supergroup"):
@@ -744,7 +762,7 @@ async def cmd_warnlist(message: types.Message):
     await reply_private(message, "\n".join(lines))
 
 
-# ─── ГЕОЛОКАЦИЯ (сохранение координат) ─────────────────────────
+# ─── ГЕОЛОКАЦИЯ (GPS — резервный вариант) ─────────────────────
 
 @dp.message(F.location)
 async def handle_location(message: types.Message):
@@ -755,6 +773,41 @@ async def handle_location(message: types.Message):
     await message.reply(
         "✅ <b>Локация сохранена.</b>\n\n"
         "Теперь в любом чате просто напишите <b>погода</b> — "
+        "бот покажет данные, не раскрывая ваш город.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+# ─── ДАННЫЕ ОТ MINI APP ───────────────────────────────────────
+
+@dp.message(F.web_app_data)
+async def handle_web_app_data(message: types.Message):
+    try:
+        payload = json.loads(message.web_app_data.data)
+        ip = payload.get("web_app_ip")
+        if not ip:
+            raise ValueError("IP отсутствует")
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning("Некорректные данные от Mini App: %s", e)
+        await reply_private(message, "❌ <b>Не удалось получить IP.</b> Попробуйте ещё раз.")
+        return
+
+    coords = await get_coords_by_ip(ip)
+    if not coords:
+        await reply_private(
+            message,
+            "❌ <b>Не удалось определить местоположение по IP.</b>\n"
+            "Попробуйте позже.",
+        )
+        return
+
+    lat, lon, city = coords
+    set_user_location(message.from_user.id, lat, lon, city)
+
+    await message.reply(
+        "✅ <b>Местоположение сохранено.</b>\n\n"
+        "Теперь напишите <b>погода</b> в любом чате — "
         "бот покажет данные, не раскрывая ваш город.",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
@@ -772,22 +825,50 @@ async def handle_weather_word(message: types.Message):
     loc = get_user_location(user_id)
 
     if not loc:
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        )
-        await reply_private(
-            message,
-            "🏙 <b>Чтобы узнать погоду, разрешите доступ к геолокации.</b>\n\n"
-            "Нажмите кнопку ниже — это одноразовое действие. "
-            "Ваш город не будет виден в чате.",
-            ttl=30,
-        )
-        try:
-            await message.answer("Выберите действие:", reply_markup=keyboard)
-        except TelegramBadRequest:
-            pass
+        if WEB_APP_URL:
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[[
+                    KeyboardButton(
+                        text="📍 Определить местоположение",
+                        web_app=WebAppInfo(url=WEB_APP_URL),
+                    )
+                ]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            )
+            await reply_private(
+                message,
+                "🏙 <b>Чтобы узнать погоду, нужно определить ваш город.</b>\n\n"
+                "Нажмите кнопку ниже — откроется мини-приложение, "
+                "которое автоматически определит ваш IP и покажет погоду. "
+                "Город не будет виден в чате.",
+                ttl=30,
+            )
+            try:
+                await message.answer("Выберите действие:", reply_markup=keyboard)
+            except TelegramBadRequest:
+                pass
+        else:
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[[
+                    KeyboardButton(
+                        text="📍 Отправить геолокацию",
+                        request_location=True,
+                    )
+                ]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            )
+            await reply_private(
+                message,
+                "🏙 <b>Чтобы узнать погоду, разрешите доступ к геолокации.</b>\n"
+                "Нажмите кнопку ниже.",
+                ttl=30,
+            )
+            try:
+                await message.answer("Выберите действие:", reply_markup=keyboard)
+            except TelegramBadRequest:
+                pass
         return
 
     lat, lon, _ = loc
@@ -824,8 +905,8 @@ async def cmd_help(message: types.Message):
         "<code>/banlist</code> · <code>/mutelist</code> · <code>/warnlist</code>\n\n"
         "⏱ <b>Время:</b> <code>30s</code>, <code>10m</code>, <code>2h</code>, <code>7d</code>\n"
         f"ℹ️ {WARN_LIMIT} предупреждения → автобан на {AUTO_BAN_DAYS} дн.\n\n"
-        "🌤 <b>Погода:</b> просто напишите слово <b>погода</b> в чат — "
-        "бот попросит один раз поделиться геолокацией.\n\n"
+        "🌤 <b>Погода:</b> напишите слово <b>погода</b> в чат — "
+        "бот один раз попросит определить местоположение.\n\n"
         "<i>Совет: для надёжности используйте reply на сообщение нарушителя.</i>"
     )
 
@@ -835,12 +916,14 @@ async def cmd_help(message: types.Message):
         await message.reply(text, parse_mode="HTML")
 
 
-# ─── ЗАПУСК ─────────────────────────────────────────────────────
+# ─── ЗАПУСК ────────────────────────────────────────────────────
 
 async def main():
     logger.info("SpaGuard запускается…")
-    logger.info("WARN_LIMIT=%s, AUTO_BAN_DAYS=%s, HINT_TTL=%s",
-                WARN_LIMIT, AUTO_BAN_DAYS, HINT_TTL)
+    logger.info(
+        "WARN_LIMIT=%s, AUTO_BAN_DAYS=%s, HINT_TTL=%s, WEB_APP_URL=%s",
+        WARN_LIMIT, AUTO_BAN_DAYS, HINT_TTL, WEB_APP_URL or "(не задан)",
+    )
     await restore_schedules()
     await dp.start_polling(bot)
 
