@@ -1,0 +1,5 @@
+.env
+spaguard.db
+__pycache__/
+*.pyc
+.venv/
