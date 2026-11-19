@@ -30,7 +30,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
-MINI_APP_LINK = os.getenv("MINI_APP_LINK", "")
+# WEB_APP_URL — настоящий HTTPS-адрес вашего index.html (для web_app-кнопки)
+WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
+# MINI_APP_LINK — direct link t.me/bot/app (для inline-кнопок в группе)
+MINI_APP_LINK = os.getenv("MINI_APP_LINK", "").strip()
 
 WARN_LIMIT    = int(os.getenv("WARN_LIMIT", "3"))
 AUTO_BAN_DAYS = int(os.getenv("AUTO_BAN_DAYS", "7"))
@@ -191,8 +194,8 @@ async def reply_hint(message: types.Message, text: str, ttl: int = HINT_TTL) -> 
                 ),
             )
             return
-        except TelegramBadRequest:
-            pass
+        except TelegramBadRequest as e:
+            logger.warning("Ephemeral не удалось: %s", e)
 
     try:
         await bot.send_message(message.from_user.id, text, parse_mode="HTML")
@@ -210,8 +213,8 @@ async def reply_hint(message: types.Message, text: str, ttl: int = HINT_TTL) -> 
 async def reply_public(message: types.Message, text: str) -> None:
     try:
         await message.reply(text, parse_mode="HTML")
-    except TelegramBadRequest:
-        pass
+    except TelegramBadRequest as e:
+        logger.warning("Public reply не удалось: %s", e)
 
 
 # ─── ФОНОВЫЕ ЗАДАЧИ ────────────────────────────────────────────
@@ -333,7 +336,7 @@ def get_list(table: str, chat_id: int) -> list[tuple]:
         ).fetchall()
 
 
-# ─── ПОГОДА: ЛОКАЦИЯ ───────────────────────────────────────────
+# ─── ПОГОДА ────────────────────────────────────────────────────
 
 def get_user_location(user_id: int) -> Optional[tuple[float, float, str]]:
     with _conn() as c:
@@ -412,29 +415,63 @@ def format_weather(current: dict) -> str:
 
 
 async def show_location_button(message: types.Message) -> None:
-    if not MINI_APP_LINK:
-        await message.reply(
-            "❌ <b>Mini App не настроен.</b>\nОбратитесь к администратору.",
-            parse_mode="HTML",
-        )
-        return
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[
-            KeyboardButton(
-                text="📍 Определить местоположение",
-                web_app=WebAppInfo(url=MINI_APP_LINK),
+    logger.info("show_location_button: user=%s WEB_APP_URL=%r",
+                message.from_user.id, WEB_APP_URL)
+
+    if not WEB_APP_URL:
+        logger.error("WEB_APP_URL не задан в .env")
+        try:
+            await message.reply(
+                "❌ <b>Mini App не настроен.</b>\n"
+                "Администратор должен указать <code>WEB_APP_URL</code> в конфиге.",
+                parse_mode="HTML",
             )
-        ]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    await message.reply(
-        "🏙 <b>Нажмите кнопку ниже, чтобы определить город.</b>\n\n"
-        "Приложение автоматически определит ваш IP. "
-        "Это одноразовое действие. Город не будет виден никому.",
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
+        except TelegramBadRequest:
+            pass
+        return
+
+    if not WEB_APP_URL.startswith("https://"):
+        logger.error("WEB_APP_URL должен начинаться с https://, сейчас: %r", WEB_APP_URL)
+        try:
+            await message.reply(
+                "❌ <b>Ошибка конфигурации.</b>\n"
+                "<code>WEB_APP_URL</code> должен начинаться с <code>https://</code>.",
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest:
+            pass
+        return
+
+    try:
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[
+                KeyboardButton(
+                    text="📍 Определить местоположение",
+                    web_app=WebAppInfo(url=WEB_APP_URL),
+                )
+            ]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await message.reply(
+            "🏙 <b>Нажмите кнопку ниже, чтобы определить город.</b>\n\n"
+            "Приложение автоматически определит ваш IP. "
+            "Это одноразовое действие. Город не будет виден никому.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        logger.info("Кнопка web_app отправлена пользователю %s", message.from_user.id)
+    except TelegramBadRequest as e:
+        logger.error("Не удалось отправить кнопку: %s", e)
+        try:
+            await message.reply(
+                f"❌ <b>Ошибка при создании кнопки:</b>\n"
+                f"<code>{escape(str(e))}</code>\n\n"
+                f"Проверьте, что <code>WEB_APP_URL</code> — это HTTPS-ссылка на index.html.",
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest:
+            pass
 
 
 # ─── ПАРСИНГ И ГЕЙТ ────────────────────────────────────────────
@@ -474,107 +511,56 @@ async def gate(message: types.Message) -> bool:
 async def cmd_ban(message: types.Message, command: CommandObject):
     if not await gate(message):
         return
-
     has_reply = bool(message.reply_to_message)
     target, until_ts, reason = parse_args(command.args, has_reply, True)
-
     if not has_reply and not target:
-        await reply_hint(
-            message,
-            "📋 <b>Использование</b>\n<code>/ban [@ник | ID | reply] [время] причина</code>",
-        )
+        await reply_hint(message, "📋 <b>Использование</b>\n<code>/ban [@ник | ID | reply] [время] причина</code>")
         return
-
     user_id, name = await resolve_target(message, target)
     if not user_id:
-        await reply_hint(
-            message,
-            "❌ <b>Не удалось найти пользователя.</b>\n"
-            "Ответьте на его сообщение или укажите числовой ID.\n"
-            "<i>Поиск по @юзернейму недоступен для тех, кто не писал в чат.</i>",
-        )
+        await reply_hint(message, "❌ <b>Не удалось найти пользователя.</b>\nОтветьте на его сообщение или укажите числовой ID.")
         return
-
     is_basic = message.chat.type == "group"
     try:
         await bot.ban_chat_member(message.chat.id, user_id, until_date=until_ts)
-
         if is_basic:
-            await reply_public(
-                message,
-                "👢 <b>Пользователь исключён</b>\n\n"
-                f"👤 {user_link(user_id, name)}\n"
-                f"{format_duration_line(until_ts)}\n"
-                f"📝 Причина: {escape(reason)}",
-            )
-            await reply_hint(
-                message,
-                "⚠️ <i>Это базовая группа — чёрного списка нет. "
-                "Переведите чат в супергруппу для полноценных банов.</i>",
-            )
+            await reply_public(message, "👢 <b>Пользователь исключён</b>\n\n"
+                f"👤 {user_link(user_id, name)}\n{format_duration_line(until_ts)}\n"
+                f"📝 Причина: {escape(reason)}")
             return
-
         save_ban(message.chat.id, user_id, until_ts, reason)
         schedule_lift(message.chat.id, user_id, "ban", until_ts)
-
-        await reply_public(
-            message,
-            "🔨 <b>Пользователь забанен</b>\n\n"
-            f"👤 {user_link(user_id, name)}\n"
-            f"{format_duration_line(until_ts)}\n"
-            f"📝 Причина: {escape(reason)}",
-        )
+        await reply_public(message, "🔨 <b>Пользователь забанен</b>\n\n"
+            f"👤 {user_link(user_id, name)}\n{format_duration_line(until_ts)}\n"
+            f"📝 Причина: {escape(reason)}")
     except TelegramBadRequest as e:
-        await reply_hint(
-            message,
-            f"❌ <b>Не удалось забанить</b>\n<code>{escape(str(e))}</code>",
-        )
+        await reply_hint(message, f"❌ <b>Не удалось забанить</b>\n<code>{escape(str(e))}</code>")
 
 
 @dp.message(Command("unban"))
 async def cmd_unban(message: types.Message, command: CommandObject):
     if not await gate(message):
         return
-
     if message.chat.type == "group":
-        await reply_hint(
-            message,
-            "ℹ️ <b>Разбан недоступен в базовой группе.</b>\n"
-            "Переведите чат в супергруппу: <i>Настройки → Тип чата → Обновить до супергруппы</i>.",
-        )
+        await reply_hint(message, "ℹ️ <b>Разбан недоступен в базовой группе.</b>")
         return
-
     has_reply = bool(message.reply_to_message)
     target, _, reason = parse_args(command.args, has_reply, False)
-
     if not has_reply and not target:
-        await reply_hint(
-            message,
-            "📋 <b>Использование</b>\n<code>/unban [@ник | ID | reply] причина</code>",
-        )
+        await reply_hint(message, "📋 <b>Использование</b>\n<code>/unban [@ник | ID | reply] причина</code>")
         return
-
     user_id, name = await resolve_target(message, target)
     if not user_id:
         await reply_hint(message, "❌ <b>Не удалось найти пользователя.</b>")
         return
-
     try:
         await bot.unban_chat_member(message.chat.id, user_id, only_if_banned=True)
         remove_ban(message.chat.id, user_id)
         scheduled_tasks.pop((message.chat.id, user_id, "ban"), None)
-
-        await reply_public(
-            message,
-            "✅ <b>Пользователь разбанен</b>\n\n"
-            f"👤 {user_link(user_id, name)}\n"
-            f"📝 Причина: {escape(reason)}",
-        )
+        await reply_public(message, "✅ <b>Пользователь разбанен</b>\n\n"
+            f"👤 {user_link(user_id, name)}\n📝 Причина: {escape(reason)}")
     except TelegramBadRequest as e:
-        await reply_hint(
-            message,
-            f"❌ <b>Не удалось разбанить</b>\n<code>{escape(str(e))}</code>",
-        )
+        await reply_hint(message, f"❌ <b>Не удалось разбанить</b>\n<code>{escape(str(e))}</code>")
 
 
 # ─── МУТ ──────────────────────────────────────────────────────
@@ -583,87 +569,51 @@ async def cmd_unban(message: types.Message, command: CommandObject):
 async def cmd_mute(message: types.Message, command: CommandObject):
     if not await gate(message):
         return
-
     has_reply = bool(message.reply_to_message)
     target, until_ts, reason = parse_args(command.args, has_reply, True)
-
     if not has_reply and not target:
-        await reply_hint(
-            message,
-            "📋 <b>Использование</b>\n<code>/mute [@ник | ID | reply] [время] причина</code>",
-        )
+        await reply_hint(message, "📋 <b>Использование</b>\n<code>/mute [@ник | ID | reply] [время] причина</code>")
         return
-
     user_id, name = await resolve_target(message, target)
     if not user_id:
         await reply_hint(message, "❌ <b>Не удалось найти пользователя.</b>")
         return
-
     try:
-        await bot.restrict_chat_member(
-            message.chat.id, user_id,
+        await bot.restrict_chat_member(message.chat.id, user_id,
             permissions=ChatPermissions(can_send_messages=False),
-            until_date=until_ts,
-        )
+            until_date=until_ts)
         save_mute(message.chat.id, user_id, until_ts, reason)
         schedule_lift(message.chat.id, user_id, "mute", until_ts)
-
-        await reply_public(
-            message,
-            "🔇 <b>Пользователь замучен</b>\n\n"
-            f"👤 {user_link(user_id, name)}\n"
-            f"{format_duration_line(until_ts)}\n"
-            f"📝 Причина: {escape(reason)}",
-        )
+        await reply_public(message, "🔇 <b>Пользователь замучен</b>\n\n"
+            f"👤 {user_link(user_id, name)}\n{format_duration_line(until_ts)}\n"
+            f"📝 Причина: {escape(reason)}")
     except TelegramBadRequest as e:
-        await reply_hint(
-            message,
-            f"❌ <b>Не удалось замутить</b>\n<code>{escape(str(e))}</code>",
-        )
+        await reply_hint(message, f"❌ <b>Не удалось замутить</b>\n<code>{escape(str(e))}</code>")
 
 
 @dp.message(Command("unmute"))
 async def cmd_unmute(message: types.Message, command: CommandObject):
     if not await gate(message):
         return
-
     has_reply = bool(message.reply_to_message)
     target, _, reason = parse_args(command.args, has_reply, False)
-
     if not has_reply and not target:
-        await reply_hint(
-            message,
-            "📋 <b>Использование</b>\n<code>/unmute [@ник | ID | reply] причина</code>",
-        )
+        await reply_hint(message, "📋 <b>Использование</b>\n<code>/unmute [@ник | ID | reply] причина</code>")
         return
-
     user_id, name = await resolve_target(message, target)
     if not user_id:
         await reply_hint(message, "❌ <b>Не удалось найти пользователя.</b>")
         return
-
     try:
-        await bot.restrict_chat_member(
-            message.chat.id, user_id,
-            permissions=ChatPermissions(
-                can_send_messages=True, can_send_media_messages=True,
-                can_send_other_messages=True, can_add_web_page_previews=True,
-            ),
-        )
+        await bot.restrict_chat_member(message.chat.id, user_id,
+            permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True,
+                                        can_send_other_messages=True, can_add_web_page_previews=True))
         remove_mute(message.chat.id, user_id)
         scheduled_tasks.pop((message.chat.id, user_id, "mute"), None)
-
-        await reply_public(
-            message,
-            "🔊 <b>Мут снят</b>\n\n"
-            f"👤 {user_link(user_id, name)}\n"
-            f"📝 Причина: {escape(reason)}",
-        )
+        await reply_public(message, "🔊 <b>Мут снят</b>\n\n"
+            f"👤 {user_link(user_id, name)}\n📝 Причина: {escape(reason)}")
     except TelegramBadRequest as e:
-        await reply_hint(
-            message,
-            f"❌ <b>Не удалось снять мут</b>\n<code>{escape(str(e))}</code>",
-        )
+        await reply_hint(message, f"❌ <b>Не удалось снять мут</b>\n<code>{escape(str(e))}</code>")
 
 
 # ─── ВАРНЫ ────────────────────────────────────────────────────
@@ -672,33 +622,20 @@ async def cmd_unmute(message: types.Message, command: CommandObject):
 async def cmd_warn(message: types.Message, command: CommandObject):
     if not await gate(message):
         return
-
     has_reply = bool(message.reply_to_message)
     target, _, reason = parse_args(command.args, has_reply, False)
-
     if not has_reply and not target:
-        await reply_hint(
-            message,
-            "📋 <b>Использование</b>\n<code>/warn [@ник | ID | reply] причина</code>",
-        )
+        await reply_hint(message, "📋 <b>Использование</b>\n<code>/warn [@ник | ID | reply] причина</code>")
         return
-
     user_id, name = await resolve_target(message, target)
     if not user_id:
         await reply_hint(message, "❌ <b>Не удалось найти пользователя.</b>")
         return
-
     count = add_warn(message.chat.id, user_id, reason)
     progress = "🟩" * count + "⬜" * max(0, WARN_LIMIT - count)
-
-    await reply_public(
-        message,
-        "⚠️ <b>Выдано предупреждение</b>\n\n"
-        f"👤 {user_link(user_id, name)}\n"
-        f"📊 {progress}  <b>{count}/{WARN_LIMIT}</b>\n"
-        f"📝 Причина: {escape(reason)}",
-    )
-
+    await reply_public(message, "⚠️ <b>Выдано предупреждение</b>\n\n"
+        f"👤 {user_link(user_id, name)}\n📊 {progress}  <b>{count}/{WARN_LIMIT}</b>\n"
+        f"📝 Причина: {escape(reason)}")
     if count >= WARN_LIMIT:
         until_ts = int(time.time()) + AUTO_BAN_DAYS * 86400
         try:
@@ -706,48 +643,29 @@ async def cmd_warn(message: types.Message, command: CommandObject):
             save_ban(message.chat.id, user_id, until_ts, f"Автобан: {WARN_LIMIT} варнов")
             reset_warns(message.chat.id, user_id)
             schedule_lift(message.chat.id, user_id, "ban", until_ts)
-
-            await reply_public(
-                message,
-                "🚫 <b>Автоматический бан</b>\n\n"
-                f"👤 {user_link(user_id, name)}\n"
-                f"{format_duration_line(until_ts)}\n"
-                f"📝 Причина: достигнут лимит предупреждений ({WARN_LIMIT})",
-            )
+            await reply_public(message, "🚫 <b>Автоматический бан</b>\n\n"
+                f"👤 {user_link(user_id, name)}\n{format_duration_line(until_ts)}\n"
+                f"📝 Причина: достигнут лимит предупреждений ({WARN_LIMIT})")
         except TelegramBadRequest as e:
-            await reply_hint(
-                message,
-                f"❌ <b>Автобан не удался</b>\n<code>{escape(str(e))}</code>",
-            )
+            await reply_hint(message, f"❌ <b>Автобан не удался</b>\n<code>{escape(str(e))}</code>")
 
 
 @dp.message(Command("unwarn"))
 async def cmd_unwarn(message: types.Message, command: CommandObject):
     if not await gate(message):
         return
-
     has_reply = bool(message.reply_to_message)
     target, _, reason = parse_args(command.args, has_reply, False)
-
     if not has_reply and not target:
-        await reply_hint(
-            message,
-            "📋 <b>Использование</b>\n<code>/unwarn [@ник | ID | reply] причина</code>",
-        )
+        await reply_hint(message, "📋 <b>Использование</b>\n<code>/unwarn [@ник | ID | reply] причина</code>")
         return
-
     user_id, name = await resolve_target(message, target)
     if not user_id:
         await reply_hint(message, "❌ <b>Не удалось найти пользователя.</b>")
         return
-
     reset_warns(message.chat.id, user_id)
-    await reply_public(
-        message,
-        "✅ <b>Все предупреждения сняты</b>\n\n"
-        f"👤 {user_link(user_id, name)}\n"
-        f"📝 Причина: {escape(reason)}",
-    )
+    await reply_public(message, "✅ <b>Все предупреждения сняты</b>\n\n"
+        f"👤 {user_link(user_id, name)}\n📝 Причина: {escape(reason)}")
 
 
 # ─── СПИСКИ ────────────────────────────────────────────────────
@@ -757,10 +675,7 @@ def _render_list(title: str, rows: list[tuple], empty: str) -> str:
         return empty
     lines = [title, ""]
     for user_id, until_ts, reason in rows:
-        lines.append(
-            f"• {user_link(user_id)} — <b>{humanize_until(until_ts)}</b>\n"
-            f"   <i>{escape(reason)}</i>"
-        )
+        lines.append(f"• {user_link(user_id)} — <b>{humanize_until(until_ts)}</b>\n   <i>{escape(reason)}</i>")
     return "\n".join(lines)
 
 
@@ -769,11 +684,7 @@ async def cmd_banlist(message: types.Message):
     if not await gate(message):
         return
     if message.chat.type == "group":
-        await reply_hint(
-            message,
-            "ℹ️ <b>Список забаненных недоступен в базовой группе.</b>\n"
-            "Переведите чат в супергруппу для чёрного списка.",
-        )
+        await reply_hint(message, "ℹ️ <b>Список забаненных недоступен в базовой группе.</b>")
         return
     rows = get_list("bans", message.chat.id)
     await reply_hint(message, _render_list("🔨 <b>Забаненные</b>", rows, "📭 <i>Список пуст</i>"))
@@ -792,10 +703,8 @@ async def cmd_warnlist(message: types.Message):
     if not await gate(message):
         return
     with _conn() as c:
-        rows = c.execute(
-            "SELECT user_id, COUNT(*) FROM warns WHERE chat_id=? GROUP BY user_id",
-            (message.chat.id,),
-        ).fetchall()
+        rows = c.execute("SELECT user_id, COUNT(*) FROM warns WHERE chat_id=? GROUP BY user_id",
+                         (message.chat.id,)).fetchall()
     if not rows:
         await reply_hint(message, "📭 <i>Список предупреждений пуст</i>")
         return
@@ -813,10 +722,8 @@ async def handle_location(message: types.Message):
     loc = message.location
     label = f"{loc.latitude:.4f},{loc.longitude:.4f}"
     set_user_location(message.from_user.id, loc.latitude, loc.longitude, label)
-
     await message.reply(
-        "✅ <b>Локация сохранена.</b>\n\n"
-        "Теперь пишите <b>погода</b> в любом чате — бот покажет данные.",
+        "✅ <b>Локация сохранена.</b>\n\nТеперь пишите <b>погода</b> в любом чате — бот покажет данные.",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -826,6 +733,7 @@ async def handle_location(message: types.Message):
 
 @dp.message(F.web_app_data)
 async def handle_web_app_data(message: types.Message):
+    logger.info("WebApp data от %s: %s", message.from_user.id, message.web_app_data.data)
     try:
         payload = json.loads(message.web_app_data.data)
         ip = payload.get("web_app_ip")
@@ -833,18 +741,14 @@ async def handle_web_app_data(message: types.Message):
             raise ValueError("IP отсутствует")
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("Некорректные данные от Mini App: %s", e)
-        await message.reply(
-            "❌ <b>Не удалось получить данные из приложения.</b>\nПопробуйте ещё раз.",
-            parse_mode="HTML",
-        )
+        await message.reply("❌ <b>Не удалось получить данные из приложения.</b>\nПопробуйте ещё раз.", parse_mode="HTML")
         return
 
     coords = await get_coords_by_ip(ip)
     if not coords:
         await message.reply(
             "❌ <b>Не удалось определить местоположение по IP.</b>\n\n"
-            "Возможно, вы используете VPN или прокси — тогда город "
-            "определится неверно. Отключите VPN и попробуйте снова.",
+            "Возможно, вы используете VPN или прокси. Отключите VPN и попробуйте снова.",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -852,23 +756,22 @@ async def handle_web_app_data(message: types.Message):
 
     lat, lon, city = coords
     set_user_location(message.from_user.id, lat, lon, city)
+    logger.info("Сохранена локация для %s: %s (%s, %s)", message.from_user.id, city, lat, lon)
 
     text = "✅ <b>Местоположение сохранено.</b>\n\n"
     current = await fetch_weather(lat, lon)
     if current:
         text += format_weather(current) + "\n\n"
     text += "Теперь пишите <b>погода</b> в любом чате — бот покажет данные."
-
     await message.reply(text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
 
 
-# ─── ПОГОДА ПО СЛОВУ «ПОГОДА» ─────────────────────────────────
+# ─── ПОГОДА ПО СЛОВУ ──────────────────────────────────────────
 
 @dp.message(F.text.regexp(r"(?i)\bпогода\b"))
 async def handle_weather_word(message: types.Message):
     if message.text.startswith("/"):
         return
-
     user_id = message.from_user.id
     loc = get_user_location(user_id)
 
@@ -889,8 +792,8 @@ async def handle_weather_word(message: types.Message):
         await show_location_button(message)
         return
 
-    # В группе — эфемерная подсказка со ссылкой сразу на /start
-    deep_link = f"https://t.me/{BOT_USERNAME}?start=weather" if BOT_USERNAME else "https://t.me/"
+    # В группе — эфемерная подсказка со ссылкой на бота
+    deep_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "https://t.me/"
     await reply_hint(
         message,
         "🏙 <b>Чтобы узнать погоду, определите город.</b>\n\n"
@@ -902,50 +805,37 @@ async def handle_weather_word(message: types.Message):
 
 # ─── СТАРТ / ХЭЛП ──────────────────────────────────────────────
 
-@dp.message(CommandStart())
+@dp.message(CommandStart(deep_link=True))  # ← ГЛАВНЫЙ ФИКС
 async def cmd_start(message: types.Message, command: CommandObject):
-    # Deep-link параметр (например, ?start=weather)
-    payload = command.args
+    logger.info(
+        "📥 /start от user=%s chat=%s type=%s payload=%r",
+        message.from_user.id, message.chat.id, message.chat.type, command.args,
+    )
 
     if message.chat.type in ("group", "supergroup"):
-        # В группе /start доступен всем — показываем ссылку на ЛС
-        deep_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "https://t.me/"
         if await is_admin(message.chat.id, message.from_user.id):
             await reply_hint(message, HELP_TEXT, ttl=60)
         else:
             await reply_hint(
                 message,
-                "👋 <b>Привет!</b> Я SpaGuard — бот для модерации и погоды.\n\n"
-                f"Чтобы узнать погоду, откройте <a href=\"{deep_link}\">личный чат со мной</a>.",
+                "👋 <b>Привет! Я SpaGuard.</b>\n\n"
+                "Чтобы узнать погоду, откройте личный чат со мной.",
             )
         return
 
-    # В ЛС
-    if payload == "weather" or not get_user_location(message.from_user.id):
-        await show_location_button(message)
-        return
-
-    await message.reply(
-        "✅ <b>Местоположение уже определено.</b>\n\n"
-        "Напишите <b>погода</b> — бот покажет данные.\n\n"
-        "Команды модерации доступны в группах (см. /help).",
-        parse_mode="HTML",
-    )
+    # В ЛС — всегда показываем кнопку
+    await show_location_button(message)
 
 
 HELP_TEXT = (
     "🛡 <b>SpaGuard</b> — модерация чата\n\n"
-    "🔨 <b>Баны</b>\n"
-    "<code>/ban [@ник | ID | reply] [время] причина</code>\n"
+    "🔨 <b>Баны</b>\n<code>/ban [@ник | ID | reply] [время] причина</code>\n"
     "<code>/unban [@ник | ID | reply] причина</code>\n\n"
-    "🔇 <b>Муты</b>\n"
-    "<code>/mute [@ник | ID | reply] [время] причина</code>\n"
+    "🔇 <b>Муты</b>\n<code>/mute [@ник | ID | reply] [время] причина</code>\n"
     "<code>/unmute [@ник | ID | reply] причина</code>\n\n"
-    "⚠️ <b>Предупреждения</b>\n"
-    "<code>/warn [@ник | ID | reply] причина</code>\n"
+    "⚠️ <b>Предупреждения</b>\n<code>/warn [@ник | ID | reply] причина</code>\n"
     "<code>/unwarn [@ник | ID | reply] причина</code>\n\n"
-    "📋 <b>Списки</b>\n"
-    "<code>/banlist</code> · <code>/mutelist</code> · <code>/warnlist</code>\n\n"
+    "📋 <b>Списки</b>\n<code>/banlist</code> · <code>/mutelist</code> · <code>/warnlist</code>\n\n"
     "⏱ <b>Время:</b> <code>30s</code>, <code>10m</code>, <code>2h</code>, <code>7d</code>\n"
     f"ℹ️ {WARN_LIMIT} предупреждения → автобан на {AUTO_BAN_DAYS} дн.\n\n"
     "🌤 <b>Погода:</b> напишите слово <b>погода</b> в чат."
@@ -967,16 +857,19 @@ async def cmd_help(message: types.Message):
 
 async def main():
     global BOT_USERNAME
-
     logger.info("SpaGuard запускается…")
-
     me = await bot.get_me()
     BOT_USERNAME = me.username
     logger.info("Бот: @%s", BOT_USERNAME)
-    logger.info(
-        "WARN_LIMIT=%s, AUTO_BAN_DAYS=%s, HINT_TTL=%s, MINI_APP_LINK=%s",
-        WARN_LIMIT, AUTO_BAN_DAYS, HINT_TTL, MINI_APP_LINK or "(не задан)",
-    )
+    logger.info("WEB_APP_URL=%r", WEB_APP_URL or "(не задан)")
+    logger.info("MINI_APP_LINK=%r", MINI_APP_LINK or "(не задан)")
+    logger.info("WARN_LIMIT=%s, AUTO_BAN_DAYS=%s, HINT_TTL=%s",
+                WARN_LIMIT, AUTO_BAN_DAYS, HINT_TTL)
+
+    if not WEB_APP_URL:
+        logger.warning("⚠ WEB_APP_URL пуст — кнопка определения геолокации не будет работать")
+    elif not WEB_APP_URL.startswith("https://"):
+        logger.warning("⚠ WEB_APP_URL должен начинаться с https://")
 
     await restore_schedules()
     await dp.start_polling(bot)
