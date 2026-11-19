@@ -36,26 +36,20 @@ dp = Dispatcher()
 
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("""
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS bans (
                 chat_id INTEGER, user_id INTEGER, until_date TEXT, reason TEXT,
                 PRIMARY KEY (chat_id, user_id)
-            )
-        """)
-        cur.execute("""
+            );
             CREATE TABLE IF NOT EXISTS mutes (
                 chat_id INTEGER, user_id INTEGER, until_date TEXT, reason TEXT,
                 PRIMARY KEY (chat_id, user_id)
-            )
-        """)
-        cur.execute("""
+            );
             CREATE TABLE IF NOT EXISTS warns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER, user_id INTEGER, reason TEXT, created_at TEXT
-            )
+            );
         """)
-        conn.commit()
 
 init_db()
 
@@ -98,10 +92,14 @@ def humanize_until(until: Optional[datetime]) -> str:
     return f"{total} сек."
 
 
-def full_until(until: Optional[datetime]) -> str:
+def format_duration_line(until: Optional[datetime]) -> str:
+    """Единая строка про срок: без дублей 'навсегда · навсегда'."""
     if until is None:
-        return "навсегда"
-    return until.strftime("%d.%m.%Y %H:%M") + " UTC"
+        return "⏱ Срок: <b>навсегда</b>"
+    return (
+        f"⏱ Срок: <b>{humanize_until(until)}</b>  ·  "
+        f"<i>{until.strftime('%d.%m.%Y %H:%M')} UTC</i>"
+    )
 
 
 def user_link(user_id: int, name: Optional[str] = None) -> str:
@@ -117,15 +115,8 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
         return False
 
 
-async def resolve_target(message: types.Message, target: str) -> tuple[Optional[int], Optional[str]]:
-    """
-    Возвращает (user_id, имя).
-    Приоритет:
-    1) reply на сообщение
-    2) числовой ID
-    3) @username (только если бот уже «видел» пользователя — обычно не работает для новых)
-    """
-    # 1) reply
+async def resolve_target(message: types.Message, target: Optional[str]) -> tuple[Optional[int], Optional[str]]:
+    """Приоритет: reply → числовой ID → @username (редко работает)."""
     if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
         return u.id, u.full_name
@@ -137,13 +128,11 @@ async def resolve_target(message: types.Message, target: str) -> tuple[Optional[
     if not clean:
         return None, None
 
-    # 2) числовой ID
     try:
         return int(clean), None
     except ValueError:
         pass
 
-    # 3) @username — попытка через API (сработает редко)
     try:
         chat = await bot.get_chat(f"@{clean}")
         return chat.id, chat.full_name or clean
@@ -157,30 +146,27 @@ def _conn():
     return sqlite3.connect(DB_PATH)
 
 
-def add_warn(chat_id: int, user_id: int, reason: str) -> int:
+def add_warn(chat_id, user_id, reason) -> int:
     with _conn() as c:
         c.execute(
             "INSERT INTO warns (chat_id, user_id, reason, created_at) VALUES (?, ?, ?, ?)",
             (chat_id, user_id, reason, datetime.utcnow().isoformat()),
         )
-        n = c.execute(
+        return c.execute(
             "SELECT COUNT(*) FROM warns WHERE chat_id=? AND user_id=?",
             (chat_id, user_id),
         ).fetchone()[0]
-    return n
 
 
-def reset_warns(chat_id: int, user_id: int) -> None:
+def reset_warns(chat_id, user_id):
     with _conn() as c:
         c.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id))
 
 
 def save_ban(chat_id, user_id, until, reason):
     with _conn() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO bans VALUES (?, ?, ?, ?)",
-            (chat_id, user_id, until.isoformat() if until else None, reason),
-        )
+        c.execute("INSERT OR REPLACE INTO bans VALUES (?, ?, ?, ?)",
+                  (chat_id, user_id, until.isoformat() if until else None, reason))
 
 
 def remove_ban(chat_id, user_id):
@@ -190,10 +176,8 @@ def remove_ban(chat_id, user_id):
 
 def save_mute(chat_id, user_id, until, reason):
     with _conn() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO mutes VALUES (?, ?, ?, ?)",
-            (chat_id, user_id, until.isoformat() if until else None, reason),
-        )
+        c.execute("INSERT OR REPLACE INTO mutes VALUES (?, ?, ?, ?)",
+                  (chat_id, user_id, until.isoformat() if until else None, reason))
 
 
 def remove_mute(chat_id, user_id):
@@ -209,64 +193,84 @@ def get_list(table: str, chat_id: int) -> list[tuple]:
         ).fetchall()
 
 
-# ─── ПАРСИНГ АРГУМЕНТОВ ────────────────────────────────────────
+# ─── ПАРСИНГ АРГУМЕНТОВ (с учётом reply) ───────────────────────
 
-def parse_args(args: str, with_duration: bool):
-    parts = args.split(maxsplit=2 if with_duration else 1)
-    target = parts[0] if parts else None
+def parse_args(command_args: Optional[str], has_reply: bool, with_duration: bool):
+    """
+    Возвращает (target, duration, reason).
+    Если has_reply=True — цель берётся из reply, а command_args = [время] причина.
+    Иначе — target [время] причина.
+    """
+    parts = (command_args or "").split()
+
+    target = None
+    if not has_reply:
+        if not parts:
+            return None, None, None
+        target = parts.pop(0)
+
     duration = None
-    reason = None
+    if with_duration and parts:
+        d = parse_duration(parts[0])
+        if d:
+            duration = d
+            parts.pop(0)
 
-    if with_duration:
-        if len(parts) >= 2:
-            d = parse_duration(parts[1])
-            if d:
-                duration = d
-                reason = parts[2] if len(parts) >= 3 else "не указана"
-            else:
-                reason = " ".join(parts[1:])
-        else:
-            reason = "не указана"
-    else:
-        reason = parts[1] if len(parts) > 1 else "не указана"
-
+    reason = " ".join(parts) if parts else "не указана"
     return target, duration, reason
 
 
-# ─── ХЭНДЛЕРЫ ───────────────────────────────────────────────────
+# ─── ХЭНДЛЕРЫ: БАН ─────────────────────────────────────────────
 
 @dp.message(Command("ban"))
 async def cmd_ban(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.reply("⛔ <b>Недостаточно прав.</b>", parse_mode="HTML")
+
+    has_reply = bool(message.reply_to_message)
+    target, duration, reason = parse_args(command.args, has_reply, with_duration=True)
+
+    if not has_reply and not target:
         return await message.reply(
-            "⛔ <b>Недостаточно прав.</b>\nКоманда доступна только администраторам.",
+            "📋 <b>Использование</b>\n"
+            "<code>/ban [@ник | ID | reply] [время] причина</code>",
             parse_mode="HTML",
         )
 
-    if not command.args:
-        return await message.reply(
-            "📋 <b>Использование</b>\n<code>/ban [@ник | ID | reply] [время] причина</code>",
-            parse_mode="HTML",
-        )
-
-    target, duration, reason = parse_args(command.args, with_duration=True)
     user_id, name = await resolve_target(message, target)
     if not user_id:
         return await message.reply(
             "❌ <b>Не удалось найти пользователя.</b>\n\n"
             "Ответьте на его сообщение или укажите числовой ID.\n"
-            "<i>Поиск по @юзернейму в Telegram Bot API недоступен для пользователей, "
+            "<i>Поиск по @юзернейму недоступен для пользователей, "
             "которые не писали в чат.</i>",
             parse_mode="HTML",
         )
 
+    is_basic_group = message.chat.type == "group"
+
     try:
         await bot.ban_chat_member(chat_id=message.chat.id, user_id=user_id, until_date=duration)
+
+        if is_basic_group:
+            # В базовой группе бан = исключение; чёрного списка нет
+            await message.reply(
+                "👢 <b>Пользователь исключён</b>\n\n"
+                f"👤 {user_link(user_id, name)}\n"
+                f"{format_duration_line(duration)}\n"
+                f"📝 Причина: {escape(reason)}\n\n"
+                "⚠️ <i>Это базовая группа — чёрного списка нет, "
+                "пользователь может вернуться по ссылке. Для настоящих банов "
+                "переведите чат в супергруппу.</i>",
+                parse_mode="HTML",
+            )
+            return
+
         save_ban(message.chat.id, user_id, duration, reason)
         await message.reply(
             "🔨 <b>Пользователь забанен</b>\n\n"
             f"👤 {user_link(user_id, name)}\n"
-            f"⏱ Срок: <b>{humanize_until(duration)}</b>  ·  <i>{full_until(duration)}</i>\n"
+            f"{format_duration_line(duration)}\n"
             f"📝 Причина: {escape(reason)}",
             parse_mode="HTML",
         )
@@ -281,16 +285,33 @@ async def cmd_ban(message: types.Message, command: CommandObject):
 async def cmd_unban(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
         return await message.reply("⛔ <b>Недостаточно прав.</b>", parse_mode="HTML")
-    if not command.args:
-        return await message.reply("📋 <b>Использование</b>\n<code>/unban [@ник | ID | reply] причина</code>", parse_mode="HTML")
 
-    target, _, reason = parse_args(command.args, with_duration=False)
+    if message.chat.type == "group":
+        return await message.reply(
+            "ℹ️ <b>Разбан недоступен</b>\n\n"
+            "Это базовая группа. Здесь бан работает как исключение — "
+            "чёрного списка нет, и пользователь может вернуться по ссылке "
+            "самостоятельно.\n\n"
+            "Чтобы пользоваться полноценными бан/разбан — переведите чат "
+            "в супергруппу: <i>Настройки чата → Тип чата → Обновить до супергруппы</i>.",
+            parse_mode="HTML",
+        )
+
+    has_reply = bool(message.reply_to_message)
+    target, _, reason = parse_args(command.args, has_reply, with_duration=False)
+
+    if not has_reply and not target:
+        return await message.reply(
+            "📋 <b>Использование</b>\n<code>/unban [@ник | ID | reply] причина</code>",
+            parse_mode="HTML",
+        )
+
     user_id, name = await resolve_target(message, target)
     if not user_id:
         return await message.reply("❌ <b>Не удалось найти пользователя.</b>", parse_mode="HTML")
 
     try:
-        await bot.unban_chat_member(chat_id=message.chat.id, user_id=user_id)
+        await bot.unban_chat_member(chat_id=message.chat.id, user_id=user_id, only_if_banned=True)
         remove_ban(message.chat.id, user_id)
         await message.reply(
             "✅ <b>Пользователь разбанен</b>\n\n"
@@ -299,23 +320,32 @@ async def cmd_unban(message: types.Message, command: CommandObject):
             parse_mode="HTML",
         )
     except TelegramBadRequest as e:
-        await message.reply(f"❌ <b>Не удалось разбанить</b>\n<code>{escape(str(e))}</code>", parse_mode="HTML")
+        await message.reply(
+            f"❌ <b>Не удалось разбанить</b>\n<code>{escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
 
+
+# ─── ХЭНДЛЕРЫ: МУТ ─────────────────────────────────────────────
 
 @dp.message(Command("mute"))
 async def cmd_mute(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
         return await message.reply("⛔ <b>Недостаточно прав.</b>", parse_mode="HTML")
-    if not command.args:
-        return await message.reply("📋 <b>Использование</b>\n<code>/mute [@ник | ID | reply] [время] причина</code>", parse_mode="HTML")
 
-    target, duration, reason = parse_args(command.args, with_duration=True)
-    user_id, name = await resolve_target(message, target)
-    if not user_id:
+    has_reply = bool(message.reply_to_message)
+    target, duration, reason = parse_args(command.args, has_reply, with_duration=True)
+
+    if not has_reply and not target:
         return await message.reply(
-            "❌ <b>Не удалось найти пользователя.</b>\nОтветьте на его сообщение или укажите числовой ID.",
+            "📋 <b>Использование</b>\n"
+            "<code>/mute [@ник | ID | reply] [время] причина</code>",
             parse_mode="HTML",
         )
+
+    user_id, name = await resolve_target(message, target)
+    if not user_id:
+        return await message.reply("❌ <b>Не удалось найти пользователя.</b>", parse_mode="HTML")
 
     try:
         await bot.restrict_chat_member(
@@ -327,22 +357,31 @@ async def cmd_mute(message: types.Message, command: CommandObject):
         await message.reply(
             "🔇 <b>Пользователь замучен</b>\n\n"
             f"👤 {user_link(user_id, name)}\n"
-            f"⏱ Срок: <b>{humanize_until(duration)}</b>  ·  <i>{full_until(duration)}</i>\n"
+            f"{format_duration_line(duration)}\n"
             f"📝 Причина: {escape(reason)}",
             parse_mode="HTML",
         )
     except TelegramBadRequest as e:
-        await message.reply(f"❌ <b>Не удалось замутить</b>\n<code>{escape(str(e))}</code>", parse_mode="HTML")
+        await message.reply(
+            f"❌ <b>Не удалось замутить</b>\n<code>{escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
 
 
 @dp.message(Command("unmute"))
 async def cmd_unmute(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
         return await message.reply("⛔ <b>Недостаточно прав.</b>", parse_mode="HTML")
-    if not command.args:
-        return await message.reply("📋 <b>Использование</b>\n<code>/unmute [@ник | ID | reply] причина</code>", parse_mode="HTML")
 
-    target, _, reason = parse_args(command.args, with_duration=False)
+    has_reply = bool(message.reply_to_message)
+    target, _, reason = parse_args(command.args, has_reply, with_duration=False)
+
+    if not has_reply and not target:
+        return await message.reply(
+            "📋 <b>Использование</b>\n<code>/unmute [@ник | ID | reply] причина</code>",
+            parse_mode="HTML",
+        )
+
     user_id, name = await resolve_target(message, target)
     if not user_id:
         return await message.reply("❌ <b>Не удалось найти пользователя.</b>", parse_mode="HTML")
@@ -363,17 +402,28 @@ async def cmd_unmute(message: types.Message, command: CommandObject):
             parse_mode="HTML",
         )
     except TelegramBadRequest as e:
-        await message.reply(f"❌ <b>Не удалось снять мут</b>\n<code>{escape(str(e))}</code>", parse_mode="HTML")
+        await message.reply(
+            f"❌ <b>Не удалось снять мут</b>\n<code>{escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
 
+
+# ─── ХЭНДЛЕРЫ: ВАРНЫ ───────────────────────────────────────────
 
 @dp.message(Command("warn"))
 async def cmd_warn(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
         return await message.reply("⛔ <b>Недостаточно прав.</b>", parse_mode="HTML")
-    if not command.args:
-        return await message.reply("📋 <b>Использование</b>\n<code>/warn [@ник | ID | reply] причина</code>", parse_mode="HTML")
 
-    target, _, reason = parse_args(command.args, with_duration=False)
+    has_reply = bool(message.reply_to_message)
+    target, _, reason = parse_args(command.args, has_reply, with_duration=False)
+
+    if not has_reply and not target:
+        return await message.reply(
+            "📋 <b>Использование</b>\n<code>/warn [@ник | ID | reply] причина</code>",
+            parse_mode="HTML",
+        )
+
     user_id, name = await resolve_target(message, target)
     if not user_id:
         return await message.reply("❌ <b>Не удалось найти пользователя.</b>", parse_mode="HTML")
@@ -397,22 +447,31 @@ async def cmd_warn(message: types.Message, command: CommandObject):
             await message.answer(
                 "🚫 <b>Автоматический бан</b>\n\n"
                 f"👤 {user_link(user_id, name)}\n"
-                f"⏱ Срок: <b>{AUTO_BAN_DAYS} дн.</b>\n"
+                f"{format_duration_line(until)}\n"
                 f"📝 Причина: достигнут лимит предупреждений ({WARN_LIMIT})",
                 parse_mode="HTML",
             )
         except TelegramBadRequest as e:
-            await message.answer(f"❌ <b>Автобан не удался</b>\n<code>{escape(str(e))}</code>", parse_mode="HTML")
+            await message.answer(
+                f"❌ <b>Автобан не удался</b>\n<code>{escape(str(e))}</code>",
+                parse_mode="HTML",
+            )
 
 
 @dp.message(Command("unwarn"))
 async def cmd_unwarn(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
         return await message.reply("⛔ <b>Недостаточно прав.</b>", parse_mode="HTML")
-    if not command.args:
-        return await message.reply("📋 <b>Использование</b>\n<code>/unwarn [@ник | ID | reply] причина</code>", parse_mode="HTML")
 
-    target, _, reason = parse_args(command.args, with_duration=False)
+    has_reply = bool(message.reply_to_message)
+    target, _, reason = parse_args(command.args, has_reply, with_duration=False)
+
+    if not has_reply and not target:
+        return await message.reply(
+            "📋 <b>Использование</b>\n<code>/unwarn [@ник | ID | reply] причина</code>",
+            parse_mode="HTML",
+        )
+
     user_id, name = await resolve_target(message, target)
     if not user_id:
         return await message.reply("❌ <b>Не удалось найти пользователя.</b>", parse_mode="HTML")
@@ -445,6 +504,15 @@ def _render_list(title: str, rows: list[tuple], empty_text: str) -> str:
 async def cmd_banlist(message: types.Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         return await message.reply("⛔ <b>Недостаточно прав.</b>", parse_mode="HTML")
+
+    if message.chat.type == "group":
+        return await message.reply(
+            "ℹ️ <b>Список забаненных недоступен</b>\n\n"
+            "В базовой группе нет чёрного списка. "
+            "Переведите чат в супергруппу для полноценной работы.",
+            parse_mode="HTML",
+        )
+
     rows = get_list("bans", message.chat.id)
     await message.reply(
         _render_list("🔨 <b>Забаненные</b>", rows, "📭 <i>Список пуст</i>"),
@@ -505,7 +573,8 @@ async def cmd_help(message: types.Message):
         "\n"
         "⏱ <b>Формат времени:</b> <code>30s</code>, <code>10m</code>, <code>2h</code>, <code>7d</code>\n"
         f"ℹ️ {WARN_LIMIT} предупреждения → автобан на {AUTO_BAN_DAYS} дн.\n\n"
-        "<i>Совет: для надежности используйте reply на сообщение нарушителя или числовой ID.</i>",
+        "<i>Совет: для надёжности используйте reply на сообщение нарушителя "
+        "или числовой ID. @юзернейм работает не всегда.</i>",
         parse_mode="HTML",
     )
 
