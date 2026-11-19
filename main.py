@@ -3,6 +3,7 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
+from html import escape
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -12,18 +13,15 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import ChatPermissions
 from aiogram.exceptions import TelegramBadRequest
 
-# ─── ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ──────────────────────────────
-# Локально читает .env; на хостинге (Railway/Render) просто берёт env vars.
+# ─── ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ───────────────────────────────────────
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "Переменная окружения BOT_TOKEN не задана."
-    )
+    raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
-WARN_LIMIT = int(os.getenv("WARN_LIMIT", "3"))         # сколько варнов до автобана
-AUTO_BAN_DAYS = int(os.getenv("AUTO_BAN_DAYS", "7"))   # на сколько дней банить
+WARN_LIMIT = int(os.getenv("WARN_LIMIT", "3"))
+AUTO_BAN_DAYS = int(os.getenv("AUTO_BAN_DAYS", "7"))
 DB_PATH = os.getenv("DB_PATH", "spaguard.db")
 
 logging.basicConfig(
@@ -35,36 +33,27 @@ logger = logging.getLogger("SpaGuard")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ─── БАЗА ДАННЫХ (SQLite) ───────────────────────────────────────
+# ─── БАЗА ДАННЫХ ────────────────────────────────────────────────
 
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bans (
-            chat_id INTEGER,
-            user_id INTEGER,
-            until_date TEXT,
-            reason TEXT,
+            chat_id INTEGER, user_id INTEGER, until_date TEXT, reason TEXT,
             PRIMARY KEY (chat_id, user_id)
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS mutes (
-            chat_id INTEGER,
-            user_id INTEGER,
-            until_date TEXT,
-            reason TEXT,
+            chat_id INTEGER, user_id INTEGER, until_date TEXT, reason TEXT,
             PRIMARY KEY (chat_id, user_id)
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS warns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            user_id INTEGER,
-            reason TEXT,
-            created_at TEXT
+            chat_id INTEGER, user_id INTEGER, reason TEXT, created_at TEXT
         )
     """)
     conn.commit()
@@ -72,254 +61,308 @@ def init_db() -> None:
 
 init_db()
 
-# ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ────────────────────────────────────
+# ─── УТИЛИТЫ ────────────────────────────────────────────────────
 
-def parse_duration(duration_str: Optional[str]) -> Optional[datetime]:
-    """'30m' / '2h' / '7d' → datetime (UTC). Без суффикса — None (навсегда)."""
-    if not duration_str:
+def parse_duration(s: Optional[str]) -> Optional[datetime]:
+    """'10s' / '30m' / '2h' / '7d' → datetime (UTC). None = навсегда."""
+    if not s:
         return None
-    unit = duration_str[-1].lower()
+    unit = s[-1].lower()
     try:
-        amount = int(duration_str[:-1])
+        amount = int(s[:-1])
     except ValueError:
         return None
-    if unit == "m":
-        delta = timedelta(minutes=amount)
-    elif unit == "h":
-        delta = timedelta(hours=amount)
-    elif unit == "d":
-        delta = timedelta(days=amount)
-    else:
+    if amount <= 0:
+        return None
+    deltas = {
+        "s": timedelta(seconds=amount),
+        "m": timedelta(minutes=amount),
+        "h": timedelta(hours=amount),
+        "d": timedelta(days=amount),
+    }
+    delta = deltas.get(unit)
+    if not delta:
         return None
     return datetime.utcnow() + delta
 
+
+def humanize_until(until: Optional[datetime]) -> str:
+    """Краткое описание срока."""
+    if until is None:
+        return "навсегда"
+    total = int((until - datetime.utcnow()).total_seconds())
+    if total <= 0:
+        return "истёк"
+    if total >= 86400:
+        return f"{total // 86400} дн."
+    if total >= 3600:
+        return f"{total // 3600} ч."
+    if total >= 60:
+        return f"{total // 60} мин."
+    return f"{total} сек."
+
+
+def full_until(until: Optional[datetime]) -> str:
+    if until is None:
+        return "навсегда"
+    return until.strftime("%d.%m.%Y %H:%M") + " UTC"
+
+
+def user_link(user_id: int, name: Optional[str] = None) -> str:
+    """Кликабельная ссылка на пользователя по ID."""
+    label = escape(name) if name and name != str(user_id) else str(user_id)
+    return f'<a href="tg://user?id={user_id}">{label}</a>'
+
+
 async def is_admin(chat_id: int, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator", "creator")
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in ("administrator", "creator")
     except TelegramBadRequest:
         return False
 
+
+async def resolve_target(message: types.Message, target: str) -> tuple[Optional[int], Optional[str]]:
+    """Возвращает (user_id, имя_или_None)."""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        return u.id, u.full_name
+
+    if not target:
+        return None, None
+
+    clean = target.strip().lstrip("@")
+    if not clean:
+        return None, None
+
+    # 1) числовой ID
+    try:
+        return int(clean), None
+    except ValueError:
+        pass
+
+    # 2) @юзернейм — через API
+    try:
+        chat = await bot.get_chat(f"@{clean}")
+        return chat.id, chat.full_name or clean
+    except TelegramBadRequest:
+        return None, None
+
+
+# ─── РАБОТА С БД ────────────────────────────────────────────────
+
+def _conn():
+    return sqlite3.connect(DB_PATH)
+
+
 def add_warn(chat_id: int, user_id: int, reason: str) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO warns (chat_id, user_id, reason, created_at) VALUES (?, ?, ?, ?)",
-        (chat_id, user_id, reason, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    cur.execute(
-        "SELECT COUNT(*) FROM warns WHERE chat_id = ? AND user_id = ?",
-        (chat_id, user_id),
-    )
-    count = cur.fetchone()[0]
-    conn.close()
-    return count
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO warns (chat_id, user_id, reason, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, user_id, reason, datetime.utcnow().isoformat()),
+        )
+        n = c.execute(
+            "SELECT COUNT(*) FROM warns WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        ).fetchone()[0]
+    return n
+
 
 def reset_warns(chat_id: int, user_id: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    conn.commit()
-    conn.close()
+    with _conn() as c:
+        c.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id))
 
-def save_ban(chat_id: int, user_id: int, until_date: Optional[datetime], reason: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO bans (chat_id, user_id, until_date, reason) VALUES (?, ?, ?, ?)",
-        (chat_id, user_id, until_date.isoformat() if until_date else None, reason),
-    )
-    conn.commit()
-    conn.close()
 
-def remove_ban(chat_id: int, user_id: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM bans WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    conn.commit()
-    conn.close()
+def save_ban(chat_id, user_id, until, reason):
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO bans VALUES (?, ?, ?, ?)",
+            (chat_id, user_id, until.isoformat() if until else None, reason),
+        )
 
-def save_mute(chat_id: int, user_id: int, until_date: Optional[datetime], reason: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO mutes (chat_id, user_id, until_date, reason) VALUES (?, ?, ?, ?)",
-        (chat_id, user_id, until_date.isoformat() if until_date else None, reason),
-    )
-    conn.commit()
-    conn.close()
 
-def remove_mute(chat_id: int, user_id: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM mutes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    conn.commit()
-    conn.close()
+def remove_ban(chat_id, user_id):
+    with _conn() as c:
+        c.execute("DELETE FROM bans WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+
+
+def save_mute(chat_id, user_id, until, reason):
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO mutes VALUES (?, ?, ?, ?)",
+            (chat_id, user_id, until.isoformat() if until else None, reason),
+        )
+
+
+def remove_mute(chat_id, user_id):
+    with _conn() as c:
+        c.execute("DELETE FROM mutes WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+
 
 def get_list(table: str, chat_id: int) -> list[tuple]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(f"SELECT user_id, until_date, reason FROM {table} WHERE chat_id = ?", (chat_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    with _conn() as c:
+        return c.execute(
+            f"SELECT user_id, until_date, reason FROM {table} WHERE chat_id=?",
+            (chat_id,),
+        ).fetchall()
 
-def resolve_target(message: types.Message, target: str) -> Optional[int]:
-    """Пытается получить user_id из reply или из @ника/ID."""
-    if message.reply_to_message:
-        return message.reply_to_message.from_user.id
-    try:
-        return int(target.strip("@"))
-    except (ValueError, AttributeError):
-        return None
 
-# ─── ХЭНДЛЕРЫ КОМАНД ────────────────────────────────────────────
+# ─── ПАРСИНГ АРГУМЕНТОВ ────────────────────────────────────────
+
+def parse_args(args: str, with_duration: bool):
+    """(target, duration, reason)."""
+    parts = args.split(maxsplit=2 if with_duration else 1)
+    target = parts[0] if parts else None
+    duration = None
+    reason = None
+
+    if with_duration:
+        if len(parts) >= 2:
+            d = parse_duration(parts[1])
+            if d:
+                duration = d
+                reason = parts[2] if len(parts) >= 3 else "не указана"
+            else:
+                reason = " ".join(parts[1:])
+        else:
+            reason = "не указана"
+    else:
+        reason = parts[1] if len(parts) > 1 else "не указана"
+
+    return target, duration, reason
+
+
+# ─── ХЭНДЛЕРЫ ───────────────────────────────────────────────────
 
 @dp.message(Command("ban"))
 async def cmd_ban(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("⛔ Только администраторы могут использовать эту команду.")
+        return await message.reply("⛔ <b>Недостаточно прав.</b>\nКоманда доступна только администраторам.")
 
     if not command.args:
-        return await message.reply("ℹ️ /ban @ник [время] причина\nПример: /ban @user 2d спам")
+        return await message.reply("📋 <b>Использование</b>\n<code>/ban @ник [время] причина</code>")
 
-    parts = command.args.split(maxsplit=2)
-    target, duration, reason = parts[0], None, None
-
-    if len(parts) >= 2:
-        parsed = parse_duration(parts[1])
-        if parsed:
-            duration = parsed
-            reason = parts[2] if len(parts) >= 3 else "Без причины"
-        else:
-            reason = " ".join(parts[1:])
-    else:
-        reason = "Без причины"
-
-    user_id = resolve_target(message, target)
+    target, duration, reason = parse_args(command.args, with_duration=True)
+    user_id, name = await resolve_target(message, target)
     if not user_id:
-        return await message.reply("❌ Укажите @ник или ответьте на сообщение пользователя.")
+        return await message.reply("❌ <b>Не удалось найти пользователя.</b>\nОтветьте на его сообщение или укажите @юзернейм / ID.")
 
     try:
         await bot.ban_chat_member(chat_id=message.chat.id, user_id=user_id, until_date=duration)
         save_ban(message.chat.id, user_id, duration, reason)
-        until_text = f"до {duration.strftime('%d.%m.%Y %H:%M')} UTC" if duration else "навсегда"
-        await message.reply(f"🔨 {target} забанен {until_text}.\nПричина: {reason}")
+        await message.reply(
+            "🔨 <b>Пользователь забанен</b>\n\n"
+            f"👤 {user_link(user_id, name)}\n"
+            f"⏱ Срок: <b>{humanize_until(duration)}</b>  ·  <i>{full_until(duration)}</i>\n"
+            f"📝 Причина: {escape(reason)}"
+        )
     except TelegramBadRequest as e:
-        await message.reply(f"❌ Не удалось забанить: {e}")
+        await message.reply(f"❌ <b>Не удалось забанить</b>\n<code>{escape(str(e))}</code>")
+
 
 @dp.message(Command("unban"))
 async def cmd_unban(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("⛔ Только администраторы могут использовать эту команду.")
+        return await message.reply("⛔ <b>Недостаточно прав.</b>")
     if not command.args:
-        return await message.reply("ℹ️ /unban @ник причина")
+        return await message.reply("📋 <b>Использование</b>\n<code>/unban @ник причина</code>")
 
-    parts = command.args.split(maxsplit=1)
-    target = parts[0]
-    reason = parts[1] if len(parts) > 1 else None
-    if not reason:
-        return await message.reply("❌ Причина обязательна. /unban @ник причина")
-
-    user_id = resolve_target(message, target)
+    target, _, reason = parse_args(command.args, with_duration=False)
+    user_id, name = await resolve_target(message, target)
     if not user_id:
-        return await message.reply("❌ Укажите @ник или ответьте на сообщение пользователя.")
+        return await message.reply("❌ <b>Не удалось найти пользователя.</b>")
 
     try:
         await bot.unban_chat_member(chat_id=message.chat.id, user_id=user_id)
         remove_ban(message.chat.id, user_id)
-        await message.reply(f"✅ {target} разбанен.\nПричина: {reason}")
+        await message.reply(
+            "✅ <b>Пользователь разбанен</b>\n\n"
+            f"👤 {user_link(user_id, name)}\n"
+            f"📝 Причина: {escape(reason)}"
+        )
     except TelegramBadRequest as e:
-        await message.reply(f"❌ Не удалось разбанить: {e}")
+        await message.reply(f"❌ <b>Не удалось разбанить</b>\n<code>{escape(str(e))}</code>")
+
 
 @dp.message(Command("mute"))
 async def cmd_mute(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("⛔ Только администраторы могут использовать эту команду.")
+        return await message.reply("⛔ <b>Недостаточно прав.</b>")
     if not command.args:
-        return await message.reply("ℹ️ /mute @ник [время] причина\nПример: /mute @user 30m флуд")
+        return await message.reply("📋 <b>Использование</b>\n<code>/mute @ник [время] причина</code>")
 
-    parts = command.args.split(maxsplit=2)
-    target, duration, reason = parts[0], None, None
-
-    if len(parts) >= 2:
-        parsed = parse_duration(parts[1])
-        if parsed:
-            duration = parsed
-            reason = parts[2] if len(parts) >= 3 else "Без причины"
-        else:
-            reason = " ".join(parts[1:])
-    else:
-        reason = "Без причины"
-
-    user_id = resolve_target(message, target)
+    target, duration, reason = parse_args(command.args, with_duration=True)
+    user_id, name = await resolve_target(message, target)
     if not user_id:
-        return await message.reply("❌ Укажите @ник или ответьте на сообщение пользователя.")
+        return await message.reply("❌ <b>Не удалось найти пользователя.</b>")
 
     try:
         await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=user_id,
+            chat_id=message.chat.id, user_id=user_id,
             permissions=ChatPermissions(can_send_messages=False),
             until_date=duration,
         )
         save_mute(message.chat.id, user_id, duration, reason)
-        until_text = f"до {duration.strftime('%d.%m.%Y %H:%M')} UTC" if duration else "навсегда"
-        await message.reply(f"🔇 {target} замучен {until_text}.\nПричина: {reason}")
+        await message.reply(
+            "🔇 <b>Пользователь замучен</b>\n\n"
+            f"👤 {user_link(user_id, name)}\n"
+            f"⏱ Срок: <b>{humanize_until(duration)}</b>  ·  <i>{full_until(duration)}</i>\n"
+            f"📝 Причина: {escape(reason)}"
+        )
     except TelegramBadRequest as e:
-        await message.reply(f"❌ Не удалось замутить: {e}")
+        await message.reply(f"❌ <b>Не удалось замутить</b>\n<code>{escape(str(e))}</code>")
+
 
 @dp.message(Command("unmute"))
 async def cmd_unmute(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("⛔ Только администраторы могут использовать эту команду.")
+        return await message.reply("⛔ <b>Недостаточно прав.</b>")
     if not command.args:
-        return await message.reply("ℹ️ /unmute @ник причина")
+        return await message.reply("📋 <b>Использование</b>\n<code>/unmute @ник причина</code>")
 
-    parts = command.args.split(maxsplit=1)
-    target = parts[0]
-    reason = parts[1] if len(parts) > 1 else None
-    if not reason:
-        return await message.reply("❌ Причина обязательна. /unmute @ник причина")
-
-    user_id = resolve_target(message, target)
+    target, _, reason = parse_args(command.args, with_duration=False)
+    user_id, name = await resolve_target(message, target)
     if not user_id:
-        return await message.reply("❌ Укажите @ник или ответьте на сообщение пользователя.")
+        return await message.reply("❌ <b>Не удалось найти пользователя.</b>")
 
     try:
         await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=user_id,
+            chat_id=message.chat.id, user_id=user_id,
             permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
+                can_send_messages=True, can_send_media_messages=True,
+                can_send_other_messages=True, can_add_web_page_previews=True,
             ),
         )
         remove_mute(message.chat.id, user_id)
-        await message.reply(f"✅ С {target} снят мут.\nПричина: {reason}")
+        await message.reply(
+            "🔊 <b>Мут снят</b>\n\n"
+            f"👤 {user_link(user_id, name)}\n"
+            f"📝 Причина: {escape(reason)}"
+        )
     except TelegramBadRequest as e:
-        await message.reply(f"❌ Не удалось снять мут: {e}")
+        await message.reply(f"❌ <b>Не удалось снять мут</b>\n<code>{escape(str(e))}</code>")
+
 
 @dp.message(Command("warn"))
 async def cmd_warn(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("⛔ Только администраторы могут использовать эту команду.")
+        return await message.reply("⛔ <b>Недостаточно прав.</b>")
     if not command.args:
-        return await message.reply("ℹ️ /warn @ник причина")
+        return await message.reply("📋 <b>Использование</b>\n<code>/warn @ник причина</code>")
 
-    parts = command.args.split(maxsplit=1)
-    target = parts[0]
-    reason = parts[1] if len(parts) > 1 else "Без причины"
-
-    user_id = resolve_target(message, target)
+    target, _, reason = parse_args(command.args, with_duration=False)
+    user_id, name = await resolve_target(message, target)
     if not user_id:
-        return await message.reply("❌ Укажите @ник или ответьте на сообщение пользователя.")
+        return await message.reply("❌ <b>Не удалось найти пользователя.</b>")
 
     count = add_warn(message.chat.id, user_id, reason)
-    await message.reply(f"⚠️ {target} получил предупреждение ({count}/{WARN_LIMIT}).\nПричина: {reason}")
+    progress = "🟩" * count + "⬜" * max(0, WARN_LIMIT - count)
+    await message.reply(
+        "⚠️ <b>Выдано предупреждение</b>\n\n"
+        f"👤 {user_link(user_id, name)}\n"
+        f"📊 {progress}  <b>{count}/{WARN_LIMIT}</b>\n"
+        f"📝 Причина: {escape(reason)}"
+    )
 
     if count >= WARN_LIMIT:
         until = datetime.utcnow() + timedelta(days=AUTO_BAN_DAYS)
@@ -328,85 +371,118 @@ async def cmd_warn(message: types.Message, command: CommandObject):
             save_ban(message.chat.id, user_id, until, f"Автобан: {WARN_LIMIT} варнов")
             reset_warns(message.chat.id, user_id)
             await message.answer(
-                f"🚫 {target} автоматически забанен на {AUTO_BAN_DAYS} дней "
-                f"за достижение лимита предупреждений ({WARN_LIMIT})."
+                "🚫 <b>Автоматический бан</b>\n\n"
+                f"👤 {user_link(user_id, name)}\n"
+                f"⏱ Срок: <b>{AUTO_BAN_DAYS} дн.</b>\n"
+                f"📝 Причина: достигнут лимит предупреждений ({WARN_LIMIT})"
             )
         except TelegramBadRequest as e:
-            await message.answer(f"❌ Не удалось автоматически забанить: {e}")
+            await message.answer(f"❌ <b>Автобан не удался</b>\n<code>{escape(str(e))}</code>")
+
 
 @dp.message(Command("unwarn"))
 async def cmd_unwarn(message: types.Message, command: CommandObject):
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("⛔ Только администраторы могут использовать эту команду.")
+        return await message.reply("⛔ <b>Недостаточно прав.</b>")
     if not command.args:
-        return await message.reply("ℹ️ /unwarn @ник причина")
+        return await message.reply("📋 <b>Использование</b>\n<code>/unwarn @ник причина</code>")
 
-    parts = command.args.split(maxsplit=1)
-    target = parts[0]
-    reason = parts[1] if len(parts) > 1 else None
-    if not reason:
-        return await message.reply("❌ Причина обязательна. /unwarn @ник причина")
-
-    user_id = resolve_target(message, target)
+    target, _, reason = parse_args(command.args, with_duration=False)
+    user_id, name = await resolve_target(message, target)
     if not user_id:
-        return await message.reply("❌ Укажите @ник или ответьте на сообщение пользователя.")
+        return await message.reply("❌ <b>Не удалось найти пользователя.</b>")
 
     reset_warns(message.chat.id, user_id)
-    await message.reply(f"✅ С {target} сняты все предупреждения.\nПричина: {reason}")
+    await message.reply(
+        "✅ <b>Все предупреждения сняты</b>\n\n"
+        f"👤 {user_link(user_id, name)}\n"
+        f"📝 Причина: {escape(reason)}"
+    )
 
-# ─── КОМАНДЫ СПИСКОВ ────────────────────────────────────────────
+
+# ─── СПИСКИ ─────────────────────────────────────────────────────
+
+def _render_list(title: str, rows: list[tuple], empty_text: str) -> str:
+    if not rows:
+        return empty_text
+    lines = [title, ""]
+    for user_id, until, reason in rows:
+        until_dt = datetime.fromisoformat(until) if until else None
+        lines.append(
+            f"• {user_link(user_id)} — <b>{humanize_until(until_dt)}</b>\n"
+            f"   <i>{escape(reason)}</i>"
+        )
+    return "\n".join(lines)
+
 
 @dp.message(Command("banlist"))
 async def cmd_banlist(message: types.Message):
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("⛔ Только администраторы могут просматривать список.")
+        return await message.reply("⛔ <b>Недостаточно прав.</b>")
     rows = get_list("bans", message.chat.id)
-    if not rows:
-        return await message.reply("📭 Список забаненных пуст.")
-    lines = ["🔨 **Забаненные:**"]
-    for user_id, until, reason in rows:
-        until_text = until.split("T")[0] if until else "навсегда"
-        lines.append(f"• `{user_id}` — до {until_text} — {reason}")
-    await message.reply("\n".join(lines), parse_mode="Markdown")
+    await message.reply(_render_list("🔨 <b>Забаненные</b>", rows, "📭 <i>Список пуст</i>"))
+
 
 @dp.message(Command("mutelist"))
 async def cmd_mutelist(message: types.Message):
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("⛔ Только администраторы могут просматривать список.")
+        return await message.reply("⛔ <b>Недостаточно прав.</b>")
     rows = get_list("mutes", message.chat.id)
-    if not rows:
-        return await message.reply("📭 Список замученных пуст.")
-    lines = ["🔇 **Замученные:**"]
-    for user_id, until, reason in rows:
-        until_text = until.split("T")[0] if until else "навсегда"
-        lines.append(f"• `{user_id}` — до {until_text} — {reason}")
-    await message.reply("\n".join(lines), parse_mode="Markdown")
+    await message.reply(_render_list("🔇 <b>Замученные</b>", rows, "📭 <i>Список пуст</i>"))
+
 
 @dp.message(Command("warnlist"))
 async def cmd_warnlist(message: types.Message):
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("⛔ Только администраторы могут просматривать список.")
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT user_id, COUNT(*) FROM warns WHERE chat_id = ? GROUP BY user_id",
-        (message.chat.id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
+        return await message.reply("⛔ <b>Недостаточно прав.</b>")
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT user_id, COUNT(*) FROM warns WHERE chat_id=? GROUP BY user_id",
+            (message.chat.id,),
+        ).fetchall()
     if not rows:
-        return await message.reply("📭 Список предупреждений пуст.")
-    lines = ["⚠️ **Предупреждения:**"]
+        return await message.reply("📭 <i>Список предупреждений пуст</i>")
+    lines = ["⚠️ <b>Предупреждения</b>", ""]
     for user_id, count in rows:
-        lines.append(f"• `{user_id}` — {count} шт.")
-    await message.reply("\n".join(lines), parse_mode="Markdown")
+        progress = "🟩" * count + "⬜" * max(0, WARN_LIMIT - count)
+        lines.append(f"• {user_link(user_id)} — {progress} <b>{count}/{WARN_LIMIT}</b>")
+    await message.reply("\n".join(lines))
+
+
+# ─── ХЭЛП ───────────────────────────────────────────────────────
+
+@dp.message(Command("help", "start"))
+async def cmd_help(message: types.Message):
+    await message.reply(
+        "🛡 <b>SpaGuard</b> — модерация чата\n"
+        "\n"
+        "🔨 <b>Баны</b>\n"
+        "<code>/ban @ник [время] причина</code>\n"
+        "<code>/unban @ник причина</code>\n"
+        "\n"
+        "🔇 <b>Муты</b>\n"
+        "<code>/mute @ник [время] причина</code>\n"
+        "<code>/unmute @ник причина</code>\n"
+        "\n"
+        "⚠️ <b>Предупреждения</b>\n"
+        "<code>/warn @ник причина</code>\n"
+        "<code>/unwarn @ник причина</code>\n"
+        "\n"
+        "📋 <b>Списки</b>\n"
+        "<code>/banlist</code> · <code>/mutelist</code> · <code>/warnlist</code>\n"
+        "\n"
+        "⏱ <b>Формат времени:</b> <code>30s</code>, <code>10m</code>, <code>2h</code>, <code>7d</code>\n"
+        f"ℹ️ {WARN_LIMIT} предупреждения → автобан на {AUTO_BAN_DAYS} дн."
+    )
+
 
 # ─── ЗАПУСК ─────────────────────────────────────────────────────
 
 async def main():
-    logger.info("SpaGuard запускается...")
+    logger.info("SpaGuard запускается…")
     logger.info("WARN_LIMIT=%s, AUTO_BAN_DAYS=%s", WARN_LIMIT, AUTO_BAN_DAYS)
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
