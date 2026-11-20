@@ -360,80 +360,31 @@ def set_user_location(user_id: int, lat: float, lon: float, city_label: str) -> 
         c.commit()
 
 
-# Каждый сервис: (имя, URL-шаблон, функция-парсер)
-# Парсер получает JSON и возвращает (lat, lon, city) или None.
 IP_SERVICES = [
-    (
-        "ipdata.info",
-        "https://ipdata.info/json/{ip}",
-        lambda d: (
-            (d.get("latitude"), d.get("longitude"), d.get("city") or "")
-            if d.get("latitude") is not None and d.get("longitude") is not None
-            else None
-        ),
-    ),
-    (
-        "ipquery.io",
-        "https://api.ipquery.io/{ip}",
-        lambda d: (
-            (d.get("location", {}).get("latitude"),
-             d.get("location", {}).get("longitude"),
-             d.get("location", {}).get("city") or "")
-            if d.get("location", {}).get("latitude") is not None
-            and d.get("location", {}).get("longitude") is not None
-            else None
-        ),
-    ),
-    (
-        "ipgeolocationapi.io",
-        "https://ipgeolocationapi.io/{ip}",
-        lambda d: (
-            (d.get("latitude"), d.get("longitude"), d.get("city") or "")
-            if d.get("latitude") is not None and d.get("longitude") is not None
-            else None
-        ),
-    ),
-    (
-        "freeipapi.com",
-        "https://freeipapi.com/api/json/{ip}",
-        lambda d: (
-            (d.get("latitude"), d.get("longitude"), d.get("cityName") or "")
-            if d.get("latitude") is not None and d.get("longitude") is not None
-            else None
-        ),
-    ),
-    (
-        "ipinfo.io",
-        "https://ipinfo.io/{ip}/json",
-        lambda d: (
-            (
-                float(d["loc"].split(",")[0]),
-                float(d["loc"].split(",")[1]),
-                d.get("city") or "",
-            )
-            if d.get("loc")
-            else None
-        ),
-    ),
-    (
-        "ipwhois.app",
-        "https://ipwhois.app/json/{ip}",
-        lambda d: (
-            (d.get("latitude"), d.get("longitude"), d.get("city") or "")
-            if d.get("latitude") is not None and d.get("longitude") is not None
-            else None
-        ),
-    ),
+    ("ipdata.info", "https://ipdata.info/json/{ip}",
+     lambda d: ((d.get("latitude"), d.get("longitude"), d.get("city") or "")
+                if d.get("latitude") is not None and d.get("longitude") is not None else None)),
+    ("ipquery.io", "https://api.ipquery.io/{ip}",
+     lambda d: ((d.get("location", {}).get("latitude"), d.get("location", {}).get("longitude"),
+                 d.get("location", {}).get("city") or "")
+                if d.get("location", {}).get("latitude") is not None else None)),
+    ("ipgeolocationapi.io", "https://ipgeolocationapi.io/{ip}",
+     lambda d: ((d.get("latitude"), d.get("longitude"), d.get("city") or "")
+                if d.get("latitude") is not None and d.get("longitude") is not None else None)),
+    ("freeipapi.com", "https://freeipapi.com/api/json/{ip}",
+     lambda d: ((d.get("latitude"), d.get("longitude"), d.get("cityName") or "")
+                if d.get("latitude") is not None and d.get("longitude") is not None else None)),
+    ("ipinfo.io", "https://ipinfo.io/{ip}/json",
+     lambda d: ((float(d["loc"].split(",")[0]), float(d["loc"].split(",")[1]), d.get("city") or "")
+                if d.get("loc") else None)),
+    ("ipwhois.app", "https://ipwhois.app/json/{ip}",
+     lambda d: ((d.get("latitude"), d.get("longitude"), d.get("city") or "")
+                if d.get("latitude") is not None and d.get("longitude") is not None else None)),
 ]
 
 
 async def get_coords_by_ip(ip: str) -> Optional[tuple[float, float, str]]:
-    """
-    Перебирает несколько бесплатных HTTPS-сервисов геолокации по IP.
-    Возвращает первые валидные координаты или None.
-    """
     timeout = aiohttp.ClientTimeout(total=6, connect=3)
-
     for name, url_tpl, parser in IP_SERVICES:
         url = url_tpl.format(ip=ip)
         try:
@@ -450,19 +401,15 @@ async def get_coords_by_ip(ip: str) -> Optional[tuple[float, float, str]]:
                         logger.warning("%s вернул не-JSON для IP %s: %s",
                                        name, ip, body[:200])
                         continue
-
                     result = parser(data)
                     if result is None:
                         logger.warning("%s не дал координат для IP %s: %s",
                                        name, ip, str(data)[:300])
                         continue
-
                     lat, lon, city = result
-                    # Нормализуем типы
                     lat, lon = float(lat), float(lon)
                     logger.info("%s → %s (%s, %s)", name, city, lat, lon)
                     return lat, lon, city
-
         except aiohttp.ClientConnectorCertificateError as e:
             logger.warning("%s: SSL-ошибка: %s", name, e)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -474,6 +421,7 @@ async def get_coords_by_ip(ip: str) -> Optional[tuple[float, float, str]]:
 
 
 async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
+    """Возвращает полный ответ Open-Meteo: current + hourly + daily."""
     if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
         logger.error("Некорректные координаты: lat=%r, lon=%r", lat, lon)
         return None
@@ -481,8 +429,14 @@ async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+        "current": (
+            "temperature_2m,relative_humidity_2m,apparent_temperature,"
+            "weather_code,wind_speed_10m"
+        ),
+        "hourly": "temperature_2m",
+        "daily": "temperature_2m_max,temperature_2m_min",
         "timezone": "auto",
+        "forecast_days": 1,
     }
 
     for attempt, use_ssl in enumerate((True, False), 1):
@@ -504,7 +458,10 @@ async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
                     except json.JSONDecodeError as e:
                         logger.error("Open-Meteo вернул невалидный JSON: %s", e)
                         continue
-                    return data.get("current")
+                    if not data.get("current"):
+                        logger.warning("В ответе Open-Meteo нет current")
+                        continue
+                    return data
         except aiohttp.ClientConnectorCertificateError as e:
             logger.warning("SSL-ошибка (нет ca-certificates?): %s", e)
             continue
@@ -517,24 +474,86 @@ async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
     return None
 
 
-def format_weather(current: dict) -> str:
+# ─── ФОРМАТИРОВАНИЕ ПОГОДЫ ─────────────────────────────────────
+
+def _round_temp(t: float) -> int:
+    """Обычное округление (не банковское), как в Яндекс.Погоде."""
+    return int(t + 0.5) if t >= 0 else int(t - 0.5)
+
+
+def _fmt_temp(t: Optional[float]) -> str:
+    if t is None:
+        return "—"
+    r = _round_temp(t)
+    if r > 0:
+        return f"+{r}°"
+    if r < 0:
+        return f"−{abs(r)}°"   # U+2212 минус
+    return "0°"
+
+
+def _fmt_wind(kmh: Optional[float]) -> str:
+    if kmh is None:
+        return "—"
+    ms = kmh / 3.6
+    return f"{ms:.1f}".replace(".", ",") + " м/с"
+
+
+def _extract_day_evening(data: dict) -> tuple[Optional[float], Optional[float]]:
+    """Возвращает (темп в 12:00, темп в 20:00) по локальному времени."""
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    if not times or not temps:
+        return None, None
+
+    day_temp = None
+    eve_temp = None
+    for i, t in enumerate(times):
+        if i >= len(temps):
+            break
+        try:
+            hour = int(t.split("T")[1].split(":")[0])
+        except (IndexError, ValueError):
+            continue
+        if hour == 12 and day_temp is None:
+            day_temp = temps[i]
+        elif hour == 20 and eve_temp is None:
+            eve_temp = temps[i]
+        if day_temp is not None and eve_temp is not None:
+            break
+    return day_temp, eve_temp
+
+
+def format_weather(data: dict) -> str:
+    current = data.get("current") or {}
     temp = current.get("temperature_2m")
     feels = current.get("apparent_temperature")
-    humidity = current.get("relative_humidity_2m")
-    wind = current.get("wind_speed_10m")
+    wind_kmh = current.get("wind_speed_10m")
     code = current.get("weather_code")
     desc = WMO_DESCRIPTIONS.get(code, "🌡 Погода")
 
-    lines = [f"{desc}", ""]
-    if temp is not None:
-        line = f"🌡 <b>{temp}°C</b>"
-        if feels is not None:
-            line += f"  (ощущается как {feels}°C)"
-        lines.append(line)
-    if humidity is not None:
-        lines.append(f"💧 Влажность: <b>{humidity}%</b>")
-    if wind is not None:
-        lines.append(f"💨 Ветер: <b>{wind} км/ч</b>")
+    lines = [f"🌡 <b>{_fmt_temp(temp)}</b>", "", desc]
+
+    wind_parts = []
+    if wind_kmh is not None:
+        wind_parts.append(f"💨 {_fmt_wind(wind_kmh)}")
+    if feels is not None:
+        # «ощущается как» показываем только если разница ≥ 1°
+        if temp is None or abs(feels - temp) >= 1:
+            wind_parts.append(f"ощущается как <b>{_fmt_temp(feels)}</b>")
+    if wind_parts:
+        lines.append("  ·  ".join(wind_parts))
+
+    day_temp, eve_temp = _extract_day_evening(data)
+    if day_temp is not None or eve_temp is not None:
+        parts = []
+        if day_temp is not None:
+            parts.append(f"Днём <b>{_fmt_temp(day_temp)}</b>")
+        if eve_temp is not None:
+            parts.append(f"Вечером <b>{_fmt_temp(eve_temp)}</b>")
+        lines.append("📅 " + " · ".join(parts))
+
     return "\n".join(lines)
 
 
@@ -877,11 +896,11 @@ async def handle_weather_word(message: types.Message):
 
     if loc:
         lat, lon, _ = loc
-        current = await fetch_weather(lat, lon)
-        if not current:
+        data = await fetch_weather(lat, lon)
+        if not data or not data.get("current"):
             await reply_hint(message, "❌ <b>Сервис погоды временно недоступен.</b>")
             return
-        text = format_weather(current)
+        text = format_weather(data)
         if message.chat.type == "private":
             await message.reply(text, parse_mode="HTML")
         else:
