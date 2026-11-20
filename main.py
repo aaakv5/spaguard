@@ -341,7 +341,7 @@ def get_list(table: str, chat_id: int) -> list[tuple]:
         ).fetchall()
 
 
-# ─── ПОГОДА: ГЕОЛОКАЦИЯ ПО IP (ipwho.is + ipapi.co) ──────────
+# ─── ПОГОДА: КАСКАД ГЕОЛОКАЦИИ ПО IP ──────────────────────────
 
 def get_user_location(user_id: int) -> Optional[tuple[float, float, str]]:
     with _conn() as c:
@@ -360,65 +360,120 @@ def set_user_location(user_id: int, lat: float, lon: float, city_label: str) -> 
         c.commit()
 
 
+# Каждый сервис: (имя, URL-шаблон, функция-парсер)
+# Парсер получает JSON и возвращает (lat, lon, city) или None.
+IP_SERVICES = [
+    (
+        "ipdata.info",
+        "https://ipdata.info/json/{ip}",
+        lambda d: (
+            (d.get("latitude"), d.get("longitude"), d.get("city") or "")
+            if d.get("latitude") is not None and d.get("longitude") is not None
+            else None
+        ),
+    ),
+    (
+        "ipquery.io",
+        "https://api.ipquery.io/{ip}",
+        lambda d: (
+            (d.get("location", {}).get("latitude"),
+             d.get("location", {}).get("longitude"),
+             d.get("location", {}).get("city") or "")
+            if d.get("location", {}).get("latitude") is not None
+            and d.get("location", {}).get("longitude") is not None
+            else None
+        ),
+    ),
+    (
+        "ipgeolocationapi.io",
+        "https://ipgeolocationapi.io/{ip}",
+        lambda d: (
+            (d.get("latitude"), d.get("longitude"), d.get("city") or "")
+            if d.get("latitude") is not None and d.get("longitude") is not None
+            else None
+        ),
+    ),
+    (
+        "freeipapi.com",
+        "https://freeipapi.com/api/json/{ip}",
+        lambda d: (
+            (d.get("latitude"), d.get("longitude"), d.get("cityName") or "")
+            if d.get("latitude") is not None and d.get("longitude") is not None
+            else None
+        ),
+    ),
+    (
+        "ipinfo.io",
+        "https://ipinfo.io/{ip}/json",
+        lambda d: (
+            (
+                float(d["loc"].split(",")[0]),
+                float(d["loc"].split(",")[1]),
+                d.get("city") or "",
+            )
+            if d.get("loc")
+            else None
+        ),
+    ),
+    (
+        "ipwhois.app",
+        "https://ipwhois.app/json/{ip}",
+        lambda d: (
+            (d.get("latitude"), d.get("longitude"), d.get("city") or "")
+            if d.get("latitude") is not None and d.get("longitude") is not None
+            else None
+        ),
+    ),
+]
+
+
 async def get_coords_by_ip(ip: str) -> Optional[tuple[float, float, str]]:
     """
-    Пытается получить координаты по IP через несколько бесплатных сервисов.
-    Порядок: ipwho.is → ipapi.co.
+    Перебирает несколько бесплатных HTTPS-сервисов геолокации по IP.
+    Возвращает первые валидные координаты или None.
     """
-    # ── 1) ipwho.is ─────────────────────────────────────────────
-    try:
-        timeout = aiohttp.ClientTimeout(total=10, connect=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            url = f"https://ipwho.is/{ip}"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("success") is False:
-                        logger.warning("ipwho.is: success=false для IP %s: %s", ip, data.get("message"))
-                    else:
-                        lat = data.get("latitude")
-                        lon = data.get("longitude")
-                        city = data.get("city") or ""
-                        if lat is not None and lon is not None:
-                            logger.info("ipwho.is дал координаты для %s: %s (%s, %s)", ip, city, lat, lon)
-                            return float(lat), float(lon), city
-                        else:
-                            logger.warning("ipwho.is: нет координат для IP %s: %s", ip, data)
-                else:
-                    logger.warning("ipwho.is вернул %s для IP %s", resp.status, ip)
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.warning("ipwho.is недоступен: %s: %s", type(e).__name__, e)
+    timeout = aiohttp.ClientTimeout(total=6, connect=3)
 
-    # ── 2) ipapi.co (резерв) ────────────────────────────────────
-    try:
-        timeout = aiohttp.ClientTimeout(total=10, connect=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            url = f"https://ipapi.co/{ip}/json/"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("error"):
-                        logger.warning("ipapi.co: error для IP %s: %s", ip, data.get("reason"))
-                    else:
-                        lat = data.get("latitude")
-                        lon = data.get("longitude")
-                        city = data.get("city") or ""
-                        if lat is not None and lon is not None:
-                            logger.info("ipapi.co дал координаты для %s: %s (%s, %s)", ip, city, lat, lon)
-                            return float(lat), float(lon), city
-                        else:
-                            logger.warning("ipapi.co: нет координат для IP %s: %s", ip, data)
-                else:
-                    logger.warning("ipapi.co вернул %s для IP %s", resp.status, ip)
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.warning("ipapi.co недоступен: %s: %s", type(e).__name__, e)
+    for name, url_tpl, parser in IP_SERVICES:
+        url = url_tpl.format(ip=ip)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    body = await resp.text()
+                    if resp.status != 200:
+                        logger.warning("%s вернул %s для IP %s: %s",
+                                       name, resp.status, ip, body[:200])
+                        continue
+                    try:
+                        data = json.loads(body)
+                    except json.JSONDecodeError:
+                        logger.warning("%s вернул не-JSON для IP %s: %s",
+                                       name, ip, body[:200])
+                        continue
 
-    logger.error("Не удалось получить координаты ни через ipwho.is, ни через ipapi.co для IP %s", ip)
+                    result = parser(data)
+                    if result is None:
+                        logger.warning("%s не дал координат для IP %s: %s",
+                                       name, ip, str(data)[:300])
+                        continue
+
+                    lat, lon, city = result
+                    # Нормализуем типы
+                    lat, lon = float(lat), float(lon)
+                    logger.info("%s → %s (%s, %s)", name, city, lat, lon)
+                    return lat, lon, city
+
+        except aiohttp.ClientConnectorCertificateError as e:
+            logger.warning("%s: SSL-ошибка: %s", name, e)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning("%s недоступен: %s: %s", name, type(e).__name__, e)
+
+    logger.error("Все %d сервисов геолокации не сработали для IP %s",
+                 len(IP_SERVICES), ip)
     return None
 
 
 async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
-    """Запрос к Open-Meteo с fallback и подробным логированием."""
     if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
         logger.error("Некорректные координаты: lat=%r, lon=%r", lat, lon)
         return None
@@ -907,6 +962,8 @@ async def main():
     logger.info("WEB_APP_URL=%s", WEB_APP_URL)
     logger.info("WARN_LIMIT=%s, AUTO_BAN_DAYS=%s, HINT_TTL=%s",
                 WARN_LIMIT, AUTO_BAN_DAYS, HINT_TTL)
+    logger.info("Сервисы геолокации: %s",
+                ", ".join(name for name, _, _ in IP_SERVICES))
 
     await restore_schedules()
     await dp.start_polling(bot)
