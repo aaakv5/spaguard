@@ -43,8 +43,15 @@ if not WEB_APP_URL.startswith("https://"):
 
 WARN_LIMIT    = int(os.getenv("WARN_LIMIT", "3"))
 AUTO_BAN_DAYS = int(os.getenv("AUTO_BAN_DAYS", "7"))
-DB_PATH       = os.getenv("DB_PATH", "spaguard.db")
 HINT_TTL      = int(os.getenv("HINT_TTL", "15"))
+
+# Абсолютный путь к БД, чтобы не зависеть от рабочей директории хостинга
+_db_env = os.getenv("DB_PATH", "spaguard.db")
+if os.path.isabs(_db_env):
+    DB_PATH = _db_env
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DB_PATH = os.path.join(BASE_DIR, _db_env)
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -341,24 +348,59 @@ def get_list(table: str, chat_id: int) -> list[tuple]:
         ).fetchall()
 
 
-# ─── ПОГОДА: КАСКАД ГЕОЛОКАЦИИ ПО IP ──────────────────────────
+# ─── ЛОКАЦИЯ: СОХРАНЕНИЕ С ВЕРИФИКАЦИЕЙ ──────────────────────
 
 def get_user_location(user_id: int) -> Optional[tuple[float, float, str]]:
-    with _conn() as c:
-        return c.execute(
-            "SELECT lat, lon, city_label FROM user_locations WHERE user_id=?",
-            (user_id,),
-        ).fetchone()
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            row = c.execute(
+                "SELECT lat, lon, city_label FROM user_locations WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            logger.info("get_user_location(%s): не найдено", user_id)
+        else:
+            logger.info("get_user_location(%s): найдено %s", user_id, row)
+        return row
+    except Exception as e:
+        logger.error("get_user_location(%s): ошибка БД: %s", user_id, e)
+        return None
 
 
 def set_user_location(user_id: int, lat: float, lon: float, city_label: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute(
+                "INSERT OR REPLACE INTO user_locations (user_id, lat, lon, city_label) VALUES (?, ?, ?, ?)",
+                (user_id, lat, lon, city_label),
+            )
+            c.commit()
+    except Exception as e:
+        logger.error("set_user_location(%s): ошибка записи: %s", user_id, e)
+        return
+
+    # Верификация — перечитываем из БД
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            row = c.execute(
+                "SELECT lat, lon, city_label FROM user_locations WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            logger.error("ВЕРИФИКАЦИЯ ПРОВАЛЕНА: не удалось записать локацию для %s в %s", user_id, DB_PATH)
+        else:
+            logger.info("ВЕРИФИКАЦИЯ OK: user_id=%s, локация=%s, БД=%s", user_id, row, DB_PATH)
+    except Exception as e:
+        logger.error("Верификация упала для %s: %s", user_id, e)
+
+
+def delete_user_location(user_id: int) -> None:
     with _conn() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO user_locations (user_id, lat, lon, city_label) VALUES (?, ?, ?, ?)",
-            (user_id, lat, lon, city_label),
-        )
+        c.execute("DELETE FROM user_locations WHERE user_id=?", (user_id,))
         c.commit()
 
+
+# ─── ГЕОЛОКАЦИЯ ПО IP ─────────────────────────────────────────
 
 IP_SERVICES = [
     ("ipdata.info", "https://ipdata.info/json/{ip}",
@@ -421,7 +463,6 @@ async def get_coords_by_ip(ip: str) -> Optional[tuple[float, float, str]]:
 
 
 async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
-    """Возвращает полный ответ Open-Meteo: current + hourly + daily."""
     if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
         logger.error("Некорректные координаты: lat=%r, lon=%r", lat, lon)
         return None
@@ -447,8 +488,8 @@ async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
                 async with session.get(FORECAST_URL, params=params) as resp:
                     body = await resp.text()
                     logger.info(
-                        "Open-Meteo (attempt %d, ssl=%s): status=%s, body[:150]=%r",
-                        attempt, use_ssl, resp.status, body[:150],
+                        "Open-Meteo (attempt %d, ssl=%s): status=%s",
+                        attempt, use_ssl, resp.status,
                     )
                     if resp.status != 200:
                         logger.warning("Open-Meteo вернул %s: %s", resp.status, body[:500])
@@ -463,7 +504,7 @@ async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
                         continue
                     return data
         except aiohttp.ClientConnectorCertificateError as e:
-            logger.warning("SSL-ошибка (нет ca-certificates?): %s", e)
+            logger.warning("SSL-ошибка: %s", e)
             continue
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning("Запрос погоды (attempt %d) не удался: %s: %s",
@@ -477,7 +518,6 @@ async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
 # ─── ФОРМАТИРОВАНИЕ ПОГОДЫ ─────────────────────────────────────
 
 def _round_temp(t: float) -> int:
-    """Обычное округление (не банковское), как в Яндекс.Погоде."""
     return int(t + 0.5) if t >= 0 else int(t - 0.5)
 
 
@@ -488,7 +528,7 @@ def _fmt_temp(t: Optional[float]) -> str:
     if r > 0:
         return f"+{r}°"
     if r < 0:
-        return f"−{abs(r)}°"   # U+2212 минус
+        return f"−{abs(r)}°"
     return "0°"
 
 
@@ -500,7 +540,6 @@ def _fmt_wind(kmh: Optional[float]) -> str:
 
 
 def _extract_day_evening(data: dict) -> tuple[Optional[float], Optional[float]]:
-    """Возвращает (темп в 12:00, темп в 20:00) по локальному времени."""
     hourly = data.get("hourly") or {}
     times = hourly.get("time") or []
     temps = hourly.get("temperature_2m") or []
@@ -533,25 +572,29 @@ def format_weather(data: dict) -> str:
     code = current.get("weather_code")
     desc = WMO_DESCRIPTIONS.get(code, "🌡 Погода")
 
-    lines = [f"🌡 <b>{_fmt_temp(temp)}</b>", "", desc]
+    lines = []
 
-    wind_parts = []
+    # Строка 1: температура + ощущается как (если разница ≥ 1°)
+    temp_line = f"🌡 {_fmt_temp(temp)}"
+    if feels is not None and temp is not None and abs(feels - temp) >= 1:
+        temp_line += f" (ощущается как {_fmt_temp(feels)})"
+    lines.append(temp_line)
+
+    # Строка 2: описание
+    lines.append(desc)
+
+    # Строка 3: ветер
     if wind_kmh is not None:
-        wind_parts.append(f"💨 {_fmt_wind(wind_kmh)}")
-    if feels is not None:
-        # «ощущается как» показываем только если разница ≥ 1°
-        if temp is None or abs(feels - temp) >= 1:
-            wind_parts.append(f"ощущается как <b>{_fmt_temp(feels)}</b>")
-    if wind_parts:
-        lines.append("  ·  ".join(wind_parts))
+        lines.append(f"💨 {_fmt_wind(wind_kmh)} ветер")
 
+    # Строка 4: день/вечер
     day_temp, eve_temp = _extract_day_evening(data)
-    if day_temp is not None or eve_temp is not None:
-        parts = []
-        if day_temp is not None:
-            parts.append(f"Днём <b>{_fmt_temp(day_temp)}</b>")
-        if eve_temp is not None:
-            parts.append(f"Вечером <b>{_fmt_temp(eve_temp)}</b>")
+    parts = []
+    if day_temp is not None:
+        parts.append(f"Днём {_fmt_temp(day_temp)}")
+    if eve_temp is not None:
+        parts.append(f"Вечером {_fmt_temp(eve_temp)}")
+    if parts:
         lines.append("📅 " + " · ".join(parts))
 
     return "\n".join(lines)
@@ -848,7 +891,13 @@ async def handle_location(message: types.Message):
 
 @dp.message(F.web_app_data)
 async def handle_web_app_data(message: types.Message):
-    logger.info("WebApp data от %s: %s", message.from_user.id, message.web_app_data.data)
+    if not message.from_user:
+        logger.error("web_app_data без from_user!")
+        return
+
+    user_id = message.from_user.id
+    logger.info("WebApp data от user_id=%s: %s", user_id, message.web_app_data.data)
+
     try:
         payload = json.loads(message.web_app_data.data)
         ip = payload.get("web_app_ip")
@@ -873,15 +922,52 @@ async def handle_web_app_data(message: types.Message):
         return
 
     lat, lon, city = coords
-    set_user_location(message.from_user.id, lat, lon, city)
-    logger.info("Сохранена локация для %s: %s (%s, %s)",
-                message.from_user.id, city, lat, lon)
+    set_user_location(user_id, lat, lon, city)
+    logger.info("Сохранена локация для user_id=%s: %s (%s, %s)", user_id, city, lat, lon)
 
     await message.reply(
         "✅ <b>Местоположение сохранено.</b>\n\n"
         "Теперь напишите в чат слово <b>погода</b> — бот покажет данные.",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+# ─── ДИАГНОСТИКА ЛОКАЦИИ ─────────────────────────────────────
+
+@dp.message(Command("whereami"))
+async def cmd_whereami(message: types.Message):
+    if message.chat.type != "private":
+        return
+    user_id = message.from_user.id
+    loc = get_user_location(user_id)
+    if loc:
+        lat, lon, city = loc
+        await message.reply(
+            f"📍 <b>Сохранённая локация</b>\n\n"
+            f"Город: <b>{escape(city or '—')}</b>\n"
+            f"Координаты: <code>{lat}</code>, <code>{lon}</code>\n"
+            f"User ID: <code>{user_id}</code>\n"
+            f"БД: <code>{escape(DB_PATH)}</code>",
+            parse_mode="HTML",
+        )
+    else:
+        await message.reply(
+            f"❌ <b>Локация не найдена</b>\n\n"
+            f"User ID: <code>{user_id}</code>\n"
+            f"БД: <code>{escape(DB_PATH)}</code>",
+            parse_mode="HTML",
+        )
+
+
+@dp.message(Command("forget"))
+async def cmd_forget(message: types.Message):
+    if message.chat.type != "private":
+        return
+    delete_user_location(message.from_user.id)
+    await message.reply(
+        "🗑 <b>Локация удалена.</b>\n\nЧтобы задать новую — нажмите /start.",
+        parse_mode="HTML",
     )
 
 
@@ -941,6 +1027,18 @@ async def cmd_start(message: types.Message, command: CommandObject):
             )
         return
 
+    # В ЛС: если локация уже есть — не показываем кнопку, а сообщаем
+    loc = get_user_location(message.from_user.id)
+    if loc:
+        lat, lon, city = loc
+        await message.reply(
+            f"✅ <b>Локация уже сохранена</b> ({escape(city or '—')})\n\n"
+            f"Напишите <b>погода</b> в любом чате.\n"
+            f"Хотите сменить — /forget, затем /start.",
+            parse_mode="HTML",
+        )
+        return
+
     await show_location_button(message)
 
 
@@ -955,7 +1053,8 @@ HELP_TEXT = (
     "📋 <b>Списки</b>\n<code>/banlist</code> · <code>/mutelist</code> · <code>/warnlist</code>\n\n"
     "⏱ <b>Время:</b> <code>30s</code>, <code>10m</code>, <code>2h</code>, <code>7d</code>\n"
     f"ℹ️ {WARN_LIMIT} предупреждения → автобан на {AUTO_BAN_DAYS} дн.\n\n"
-    "🌤 <b>Погода:</b> напишите слово <b>погода</b> в чат."
+    "🌤 <b>Погода:</b> напишите слово <b>погода</b> в чат.\n"
+    "📍 <b>Локация:</b> /start в ЛС бота, /whereami — проверить, /forget — сбросить."
 )
 
 
@@ -975,12 +1074,13 @@ async def cmd_help(message: types.Message):
 async def main():
     global BOT_USERNAME
     logger.info("SpaGuard запускается…")
+    logger.info("DB_PATH=%s", DB_PATH)
+    logger.info("БД существует: %s", os.path.exists(DB_PATH))
+
     me = await bot.get_me()
     BOT_USERNAME = me.username
     logger.info("Бот: @%s", BOT_USERNAME)
     logger.info("WEB_APP_URL=%s", WEB_APP_URL)
-    logger.info("WARN_LIMIT=%s, AUTO_BAN_DAYS=%s, HINT_TTL=%s",
-                WARN_LIMIT, AUTO_BAN_DAYS, HINT_TTL)
     logger.info("Сервисы геолокации: %s",
                 ", ".join(name for name, _, _ in IP_SERVICES))
 
