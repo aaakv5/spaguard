@@ -23,29 +23,26 @@ from aiogram.types import (
 )
 from aiogram.exceptions import TelegramBadRequest
 
-# ─── КОНФИГУРАЦИЯ ──────────────────────────────────────────────
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
+    raise RuntimeError("Error BOT_TOKEN.")
 
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
 if not WEB_APP_URL:
     raise RuntimeError(
-        "WEB_APP_URL не задан.\n"
-        "Укажите в .env: WEB_APP_URL=https://ваш-username.github.io/spaguard/"
+        "Error WEB_APP_URL"
     )
 if not WEB_APP_URL.startswith("https://"):
     raise RuntimeError(
-        f"WEB_APP_URL должен начинаться с https://, сейчас: {WEB_APP_URL!r}"
+        f"Error: {WEB_APP_URL!r}"
     )
 
 WARN_LIMIT    = int(os.getenv("WARN_LIMIT", "3"))
 AUTO_BAN_DAYS = int(os.getenv("AUTO_BAN_DAYS", "7"))
 HINT_TTL      = int(os.getenv("HINT_TTL", "15"))
 
-# Абсолютный путь к БД, чтобы не зависеть от рабочей директории хостинга
 _db_env = os.getenv("DB_PATH", "spaguard.db")
 if os.path.isabs(_db_env):
     DB_PATH = _db_env
