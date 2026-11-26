@@ -74,8 +74,6 @@ dp = Dispatcher()
 
 BOT_USERNAME: Optional[str] = None
 
-# ─── БАЗА ДАННЫХ ───────────────────────────────────────────────
-
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.executescript("""
@@ -100,8 +98,6 @@ def init_db() -> None:
         """)
 
 init_db()
-
-# ─── УТИЛИТЫ ───────────────────────────────────────────────────
 
 def parse_duration(s: Optional[str]) -> Optional[int]:
     if not s:
@@ -183,8 +179,6 @@ async def resolve_target(message: types.Message, target: Optional[str]) -> tuple
         return None, None
 
 
-# ─── ОТПРАВКА СООБЩЕНИЙ ────────────────────────────────────────
-
 async def _auto_delete(msg: types.Message, delay: int) -> None:
     await asyncio.sleep(delay)
     try:
@@ -226,8 +220,6 @@ async def reply_public(message: types.Message, text: str) -> None:
     except TelegramBadRequest as e:
         logger.warning("Public reply не удалось: %s", e)
 
-
-# ─── ФОНОВЫЕ ЗАДАЧИ ────────────────────────────────────────────
 
 scheduled_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
 
@@ -287,8 +279,6 @@ async def restore_schedules() -> None:
         logger.info("Восстановлено задач: mutes=%s, bans=%s", len(mutes), len(bans))
 
 
-# ─── БД ────────────────────────────────────────────────────────
-
 def _conn():
     return sqlite3.connect(DB_PATH)
 
@@ -346,8 +336,6 @@ def get_list(table: str, chat_id: int) -> list[tuple]:
         ).fetchall()
 
 
-# ─── ЛОКАЦИЯ: СОХРАНЕНИЕ С ВЕРИФИКАЦИЕЙ ──────────────────────
-
 def get_user_location(user_id: int) -> Optional[tuple[float, float, str]]:
     try:
         with sqlite3.connect(DB_PATH) as c:
@@ -377,7 +365,6 @@ def set_user_location(user_id: int, lat: float, lon: float, city_label: str) -> 
         logger.error("set_user_location(%s): ошибка записи: %s", user_id, e)
         return
 
-    # Верификация — перечитываем из БД
     try:
         with sqlite3.connect(DB_PATH) as c:
             row = c.execute(
@@ -396,9 +383,6 @@ def delete_user_location(user_id: int) -> None:
     with _conn() as c:
         c.execute("DELETE FROM user_locations WHERE user_id=?", (user_id,))
         c.commit()
-
-
-# ─── ГЕОЛОКАЦИЯ ПО IP ─────────────────────────────────────────
 
 IP_SERVICES = [
     ("ipdata.info", "https://ipdata.info/json/{ip}",
@@ -512,9 +496,6 @@ async def fetch_weather(lat: float, lon: float) -> Optional[dict]:
     logger.error("Open-Meteo недоступен после 2 попыток")
     return None
 
-
-# ─── ФОРМАТИРОВАНИЕ ПОГОДЫ ─────────────────────────────────────
-
 def _round_temp(t: float) -> int:
     return int(t + 0.5) if t >= 0 else int(t - 0.5)
 
@@ -572,20 +553,16 @@ def format_weather(data: dict) -> str:
 
     lines = []
 
-    # Строка 1: температура + ощущается как (если разница ≥ 1°)
     temp_line = f"🌡 {_fmt_temp(temp)}"
     if feels is not None and temp is not None and abs(feels - temp) >= 1:
         temp_line += f" (ощущается как {_fmt_temp(feels)})"
     lines.append(temp_line)
 
-    # Строка 2: описание
     lines.append(desc)
 
-    # Строка 3: ветер
     if wind_kmh is not None:
         lines.append(f"💨 {_fmt_wind(wind_kmh)} ветер")
 
-    # Строка 4: день/вечер
     day_temp, eve_temp = _extract_day_evening(data)
     parts = []
     if day_temp is not None:
@@ -630,8 +607,6 @@ async def show_location_button(message: types.Message) -> None:
             pass
 
 
-# ─── ПАРСИНГ И ГЕЙТ ────────────────────────────────────────────
-
 def parse_args(command_args: Optional[str], has_reply: bool, with_duration: bool):
     parts = (command_args or "").split()
     target = None
@@ -659,9 +634,6 @@ async def gate(message: types.Message) -> bool:
         await reply_hint(message, "⛔ <b>Недостаточно прав.</b>")
         return False
     return True
-
-
-# ─── БАН ───────────────────────────────────────────────────────
 
 rules = RulesFeature(bot, dp, DB_PATH, BOT_TOKEN)
 
@@ -721,9 +693,6 @@ async def cmd_unban(message: types.Message, command: CommandObject):
     except TelegramBadRequest as e:
         await reply_hint(message, f"❌ <b>Не удалось разбанить</b>\n<code>{escape(str(e))}</code>")
 
-
-# ─── МУТ ──────────────────────────────────────────────────────
-
 @dp.message(Command("mute"))
 async def cmd_mute(message: types.Message, command: CommandObject):
     if not await gate(message):
@@ -774,9 +743,6 @@ async def cmd_unmute(message: types.Message, command: CommandObject):
     except TelegramBadRequest as e:
         await reply_hint(message, f"❌ <b>Не удалось снять мут</b>\n<code>{escape(str(e))}</code>")
 
-
-# ─── ВАРНЫ ────────────────────────────────────────────────────
-
 @dp.message(Command("warn"))
 async def cmd_warn(message: types.Message, command: CommandObject):
     if not await gate(message):
@@ -826,9 +792,6 @@ async def cmd_unwarn(message: types.Message, command: CommandObject):
     await reply_public(message, "✅ <b>Все предупреждения сняты</b>\n\n"
         f"👤 {user_link(user_id, name)}\n📝 Причина: {escape(reason)}")
 
-
-# ─── СПИСКИ ────────────────────────────────────────────────────
-
 def _render_list(title: str, rows: list[tuple], empty: str) -> str:
     if not rows:
         return empty
@@ -873,9 +836,6 @@ async def cmd_warnlist(message: types.Message):
         lines.append(f"• {user_link(user_id)} — {progress} <b>{count}/{WARN_LIMIT}</b>")
     await reply_hint(message, "\n".join(lines))
 
-
-# ─── ГЕОЛОКАЦИЯ (GPS) ─────────────────────────────────────────
-
 @dp.message(F.location)
 async def handle_location(message: types.Message):
     loc = message.location
@@ -886,9 +846,6 @@ async def handle_location(message: types.Message):
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
     )
-
-
-# ─── ДАННЫЕ ОТ MINI APP ───────────────────────────────────────
 
 @dp.message(F.web_app_data)
 async def handle_web_app_data(message: types.Message):
@@ -933,9 +890,6 @@ async def handle_web_app_data(message: types.Message):
         reply_markup=ReplyKeyboardRemove(),
     )
 
-
-# ─── ДИАГНОСТИКА ЛОКАЦИИ ─────────────────────────────────────
-
 @dp.message(Command("whereami"))
 async def cmd_whereami(message: types.Message):
     if message.chat.type != "private":
@@ -971,9 +925,6 @@ async def cmd_forget(message: types.Message):
         parse_mode="HTML",
     )
 
-
-# ─── ПОГОДА ПО СЛОВУ ──────────────────────────────────────────
-
 @dp.message(F.text.regexp(r"(?i)\bпогода\b"))
 async def handle_weather_word(message: types.Message):
     if message.text.startswith("/"):
@@ -1007,9 +958,6 @@ async def handle_weather_word(message: types.Message):
         "Это одноразовое действие. Город не будет виден в чате.",
     )
 
-
-# ─── СТАРТ ────────────────────────────────────────────────────
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, command: CommandObject):
     if await rules.handle_start(message, command.args):
@@ -1031,7 +979,6 @@ async def cmd_start(message: types.Message, command: CommandObject):
             )
         return
 
-    # В ЛС: если локация уже есть — не показываем кнопку, а сообщаем
     loc = get_user_location(message.from_user.id)
     if loc:
         lat, lon, city = loc
@@ -1073,8 +1020,6 @@ async def cmd_help(message: types.Message):
         return
     await message.reply(HELP_TEXT, parse_mode="HTML")
 
-
-# ─── ЗАПУСК ────────────────────────────────────────────────────
 
 async def main():
     global BOT_USERNAME
