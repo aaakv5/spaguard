@@ -22,6 +22,7 @@ from aiogram.types import (
     EphemeralMessageParameters,
 )
 from aiogram.exceptions import TelegramBadRequest
+from rules_feature import RulesFeature
 
 load_dotenv()
 
@@ -662,6 +663,9 @@ async def gate(message: types.Message) -> bool:
 
 # ─── БАН ───────────────────────────────────────────────────────
 
+rules = RulesFeature(bot, dp, DB_PATH, BOT_TOKEN)
+
+
 @dp.message(Command("ban"))
 async def cmd_ban(message: types.Message, command: CommandObject):
     if not await gate(message):
@@ -1008,6 +1012,9 @@ async def handle_weather_word(message: types.Message):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, command: CommandObject):
+    if await rules.handle_start(message, command.args):
+        return
+
     logger.info(
         "📥 /start от user=%s chat=%s type=%s payload=%r",
         message.from_user.id, message.chat.id, message.chat.type, command.args,
@@ -1040,6 +1047,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
 
 
 HELP_TEXT = (
+    "📖 <b>Правила:</b> /rules — читать; /rules edit — редактор для администраторов.\n\n"
     "🛡 <b>SpaGuard</b> — модерация чата\n\n"
     "🔨 <b>Баны</b>\n<code>/ban [@ник | ID | reply] [время] причина</code>\n"
     "<code>/unban [@ник | ID | reply] причина</code>\n\n"
@@ -1081,8 +1089,12 @@ async def main():
     logger.info("Сервисы геолокации: %s",
                 ", ".join(name for name, _, _ in IP_SERVICES))
 
-    await restore_schedules()
-    await dp.start_polling(bot)
+    await rules.start()
+    try:
+        await restore_schedules()
+        await dp.start_polling(bot)
+    finally:
+        await rules.stop()
 
 
 if __name__ == "__main__":
